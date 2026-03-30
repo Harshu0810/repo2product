@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from analyzer.repo_fetcher import RepoFetcher
 from utils.readme_optimizer import improve_readme_stream
+from utils.chat_interface import chat_stream
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config (must be first Streamlit call)
@@ -573,6 +574,7 @@ if analyze_btn:
         else:
             st.session_state["result"] = result
             st.session_state["constraints"] = user_constraints
+            st.session_state["chat_history"] = []
             st.rerun()
 
 
@@ -673,9 +675,9 @@ with c6:
 st.markdown("")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_ov, tab_deps, tab_res, tab_adapt, tab_plan, tab_issues, tab_dl, tab_readme_ai = st.tabs([
+tab_ov, tab_deps, tab_res, tab_adapt, tab_plan, tab_issues, tab_dl, tab_readme_ai, tab_chat = st.tabs([
     "📊 Overview", "📦 Dependencies", "💾 Resources",
-    "🔄 Adaptations", "📋 Setup Plan", "⚠️ Issues", "📥 Downloads", "📝 README AI"
+    "🔄 Adaptations", "📋 Setup Plan", "⚠️ Issues", "📥 Downloads", "📝 README AI", "💬 Chat AI"
 ])
 
 
@@ -1268,3 +1270,59 @@ with tab_readme_ai:
             )
     else:
         st.info("No README found in this repository. The README optimizer works on repos that have an existing README file.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 9 — CHAT AI
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_chat:
+    st.markdown('<div class="section-header">💬 CHAT AI</div>', unsafe_allow_html=True)
+    st.markdown(f"Ask an AI assistant about the **{summary.get('repo_name', 'project')}** repository's architecture and setup.")
+
+    _is_cloud = bool(os.environ.get("SPACE_ID") or os.environ.get("R2P_CLOUD"))
+    _ai_use_hf = user_constraints.get("use_hf", False) or _is_cloud
+    _ai_use_ollama = user_constraints.get("use_ollama", False)
+    _ai_hf_token = user_constraints.get("hf_token", "")
+    _ai_ollama_model = user_constraints.get("ollama_model", "llama3.2")
+    _ai_ollama_url = user_constraints.get("ollama_url", "http://localhost:11434")
+
+    context_data = f"""
+    Repo Name: {summary.get('repo_name')}
+    Description: {summary.get('description')}
+    Frameworks: {', '.join(summary.get('frameworks', [])) or 'None detected'}
+    Heavy Dependencies: {', '.join(summary.get('heavy_deps', []))}
+    GPU Required: {summary.get('gpu_required_flag')}
+    Compatibility Score: {summary.get('compatibility_score')}/100 ({summary.get('compatibility_label')})
+    Risk Level: {summary.get('risk_level')}
+    Setup Run Command: {plan.get('run_commands', [{{}}])[0].get('command', 'python main.py') if plan.get('run_commands') else 'None'}
+    """
+
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+        
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            
+    if prompt := st.chat_input("Ask about this repository architecture or setup..."):
+        st.session_state.chat_history.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        with st.chat_message("assistant"):
+            response_placeholder = st.empty()
+            full_answer = ""
+            for chunk in chat_stream(
+                user_query=prompt,
+                context=context_data,
+                use_hf=_ai_use_hf,
+                hf_token=_ai_hf_token,
+                use_ollama=_ai_use_ollama,
+                ollama_model=_ai_ollama_model,
+                ollama_url=_ai_ollama_url,
+            ):
+                full_answer += chunk
+                response_placeholder.markdown(full_answer + "▌")
+            response_placeholder.markdown(full_answer)
+            
+        st.session_state.chat_history.append({"role": "assistant", "content": full_answer})
