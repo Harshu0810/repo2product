@@ -53,6 +53,8 @@ class RepoFetcher:
         Supports:
           https://github.com/owner/repo
           https://github.com/owner/repo/tree/branch
+          github.com/owner/repo  (no scheme)
+          owner/repo  (bare format)
           git@github.com:owner/repo.git
         Returns (owner, repo, branch_or_None).
         """
@@ -70,6 +72,19 @@ class RepoFetcher:
         )
         if https_match:
             return https_match.group(1), https_match.group(2), https_match.group(3)
+
+        # No-scheme: github.com/owner/repo
+        no_scheme_match = re.match(
+            r"github\.com/([^/]+)/([^/]+?)(?:\.git)?(?:/tree/([^/]+))?(?:/.*)?$",
+            url,
+        )
+        if no_scheme_match:
+            return no_scheme_match.group(1), no_scheme_match.group(2), no_scheme_match.group(3)
+
+        # Bare format: owner/repo (exactly two segments, no dots in first)
+        bare_match = re.match(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$", url)
+        if bare_match:
+            return bare_match.group(1), bare_match.group(2), None
 
         raise RepoFetchError(f"Cannot parse GitHub URL: {url}")
 
@@ -99,6 +114,37 @@ class RepoFetcher:
             raise RepoFetchError(f"Network error: {e}")
         except Exception as e:
             raise RepoFetchError(f"Unexpected API error: {e}")
+
+    def fetch_user_repos(self, username: str) -> list:
+        """
+        Fetch all public repositories for a GitHub username.
+        Returns list of dicts with name, full_name, description, stars, language.
+        """
+        repos = []
+        page = 1
+        while True:
+            try:
+                url = f"{self.GITHUB_API_BASE}/users/{username}/repos?per_page=100&page={page}&sort=updated"
+                req = urllib.request.Request(url, headers=self._api_headers())
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode())
+                    if not data:
+                        break
+                    for r in data:
+                        repos.append({
+                            "name": r.get("name", ""),
+                            "full_name": r.get("full_name", ""),
+                            "description": r.get("description", "") or "",
+                            "stars": r.get("stargazers_count", 0),
+                            "language": r.get("language", "") or "",
+                        })
+                    if len(data) < 100:
+                        break
+                    page += 1
+            except Exception as e:
+                logger.warning(f"Error fetching user repos: {e}")
+                break
+        return repos
 
     def fetch_repo_metadata(self, owner: str, repo: str) -> Dict[str, Any]:
         """Fetch repository metadata from GitHub API."""

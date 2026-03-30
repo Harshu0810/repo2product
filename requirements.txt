@@ -1,8 +1,9 @@
 # Repo2Product AI — requirements
 # Install with: pip install -r requirements.txt
-# Zero paid services, CPU-only, lightweight
 
 streamlit>=1.32.0
 requests>=2.31.0
+huggingface_hub>=0.23.0
+ollama>=0.2.1
 # All other dependencies use Python stdlib only:
 # pathlib, ast, subprocess, json, re, urllib, zipfile, etc.

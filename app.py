@@ -11,6 +11,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 import streamlit as st
 import time
 from pathlib import Path
+from analyzer.repo_fetcher import RepoFetcher
+from utils.readme_optimizer import improve_readme_stream
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config (must be first Streamlit call)
@@ -474,17 +476,58 @@ with st.sidebar:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Input row
+# Input row — Smart input: URL or Username browse
 # ─────────────────────────────────────────────────────────────────────────────
 
 default_url = st.session_state.pop("prefill_url", "")
-col_url, col_btn = st.columns([5, 1])
-with col_url:
-    repo_url = st.text_input("GitHub URL", value=default_url,
-                              placeholder="https://github.com/owner/repository",
-                              label_visibility="collapsed")
-with col_btn:
-    analyze_btn = st.button("⚡ Analyze", type="primary", use_container_width=True)
+input_mode = st.radio(
+    "Input mode",
+    ["🔗 Enter Repo URL / owner/repo", "👤 Browse User Repos"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
+
+repo_url = ""
+analyze_btn = False
+
+if input_mode == "🔗 Enter Repo URL / owner/repo":
+    col_url, col_btn = st.columns([5, 1])
+    with col_url:
+        repo_url = st.text_input("GitHub URL", value=default_url,
+                                  placeholder="https://github.com/owner/repo  or  owner/repo",
+                                  label_visibility="collapsed")
+    with col_btn:
+        analyze_btn = st.button("⚡ Analyze", type="primary", use_container_width=True)
+else:
+    col_user, col_fetch = st.columns([4, 1])
+    with col_user:
+        gh_username = st.text_input("GitHub Username", placeholder="e.g. torvalds",
+                                     label_visibility="collapsed")
+    with col_fetch:
+        fetch_repos_btn = st.button("🔍 Fetch Repos", use_container_width=True)
+
+    if fetch_repos_btn and gh_username:
+        with st.spinner("Fetching repositories..."):
+            _fetcher = RepoFetcher(github_token=github_token or None)
+            user_repos = _fetcher.fetch_user_repos(gh_username.strip())
+            if user_repos:
+                st.session_state["_browse_repos"] = user_repos
+                st.session_state["_browse_user"] = gh_username.strip()
+            else:
+                st.warning(f"No public repos found for **{gh_username}**. Check the username.")
+
+    if "_browse_repos" in st.session_state:
+        user_repos = st.session_state["_browse_repos"]
+        browse_user = st.session_state["_browse_user"]
+        repo_options = [f"{r['name']}  ⭐{r['stars']}  ({r['language'] or '—'})" for r in user_repos]
+        selected_idx = st.selectbox(
+            f"Repositories for **{browse_user}** ({len(user_repos)} repos)",
+            range(len(repo_options)),
+            format_func=lambda i: repo_options[i],
+        )
+        if selected_idx is not None:
+            repo_url = f"https://github.com/{user_repos[selected_idx]['full_name']}"
+        analyze_btn = st.button("⚡ Analyze Selected Repo", type="primary", use_container_width=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -630,9 +673,9 @@ with c6:
 st.markdown("")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_ov, tab_deps, tab_res, tab_adapt, tab_plan, tab_issues, tab_dl = st.tabs([
+tab_ov, tab_deps, tab_res, tab_adapt, tab_plan, tab_issues, tab_dl, tab_readme_ai = st.tabs([
     "📊 Overview", "📦 Dependencies", "💾 Resources",
-    "🔄 Adaptations", "📋 Setup Plan", "⚠️ Issues", "📥 Downloads"
+    "🔄 Adaptations", "📋 Setup Plan", "⚠️ Issues", "📥 Downloads", "📝 README AI"
 ])
 
 
@@ -1167,3 +1210,61 @@ python3 -m venv venv && source venv/bin/activate
 pip install -r requirements_adapted.txt
 cp .env.template .env  # Edit with your values
 {run_cmd_first}""", language="bash")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 8 — README AI OPTIMIZER
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_readme_ai:
+    st.markdown('<div class="section-header">📝 AI README OPTIMIZER</div>', unsafe_allow_html=True)
+    st.markdown("Improve any repository's README with AI — powered by your selected AI engine.")
+
+    _is_cloud = bool(os.environ.get("SPACE_ID") or os.environ.get("R2P_CLOUD"))
+    _ai_use_hf = user_constraints.get("use_hf", False) or _is_cloud
+    _ai_use_ollama = user_constraints.get("use_ollama", False)
+    _ai_hf_token = user_constraints.get("hf_token", "")
+    _ai_ollama_model = user_constraints.get("ollama_model", "llama3.2")
+    _ai_ollama_url = user_constraints.get("ollama_url", "http://localhost:11434")
+
+    # Get README from key_files
+    readme_content = ""
+    key_files = fetch.get("key_files", {})
+    for fname in ["README.md", "README.rst", "README.txt", "readme.md"]:
+        if fname in key_files:
+            readme_content = key_files[fname]
+            break
+
+    if readme_content:
+        with st.expander("📄 Current README (click to expand)", expanded=False):
+            st.markdown(readme_content[:5000])
+
+        if st.button("⚡ Optimize README with AI", type="primary", use_container_width=True):
+            st.markdown("---")
+            st.markdown("### ✨ Improved README")
+            improved_container = st.empty()
+            full_text = ""
+            for chunk in improve_readme_stream(
+                readme_content,
+                use_hf=_ai_use_hf,
+                hf_token=_ai_hf_token,
+                use_ollama=_ai_use_ollama,
+                ollama_model=_ai_ollama_model,
+                ollama_url=_ai_ollama_url,
+            ):
+                full_text += chunk
+                improved_container.markdown(full_text + "▌")
+            improved_container.markdown(full_text)
+
+            if full_text and not full_text.startswith("Error") and not full_text.startswith("⚠️"):
+                st.session_state["_optimized_readme"] = full_text
+
+        if "_optimized_readme" in st.session_state:
+            st.download_button(
+                "📥 Download Improved README",
+                st.session_state["_optimized_readme"],
+                file_name="README_IMPROVED.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+    else:
+        st.info("No README found in this repository. The README optimizer works on repos that have an existing README file.")

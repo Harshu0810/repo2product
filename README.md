@@ -26,26 +26,29 @@ Gone are the days of struggling with broken dependencies, out-of-memory errors, 
 
 ## ✨ Key Features
 
-- **🧠 Resource-Aware Adaptation** — Tell the tool your available RAM, OS, and GPU status. It will dynamically calculate optimal worker threads, memory configurations, and generate tailored run scripts.
-- **🔄 GPU-to-CPU Fallbacks** — No GPU? No problem. The system intelligently analyzes dependencies, swaps out GPU-bound packages (like `tensorflow-gpu` or `torch` with CUDA) for CPU-only equivalents, and patches code where necessary. 
-- **🐳 Auto-Dockerization** — Automatically generates multi-container `docker-compose.yml` and `Dockerfile` setups with appropriate exposed ports based on the project's framework (FastAPI, Django, React, etc.).
+- **🔗 Smart Repo Input** — Enter a full URL (`https://github.com/owner/repo`), a bare `owner/repo`, or just a GitHub **username** to browse and select from their public repositories.
+- **🧠 Resource-Aware Adaptation** — Tell the tool your available RAM, OS, and GPU status. It dynamically calculates optimal worker threads, memory configurations, and generates tailored run scripts.
+- **🔄 GPU-to-CPU Fallbacks** — No GPU? No problem. The system intelligently swaps GPU-bound packages for CPU-only equivalents and patches code where necessary.
+- **📝 AI README Optimizer** — Improve any repository's README with AI-powered suggestions. Uses Hugging Face Cloud or local Ollama for streaming generation.
+- **🐳 Auto-Dockerization** — Automatically generates multi-container `docker-compose.yml` and `Dockerfile` setups with appropriate exposed ports.
 - **📦 Smart Dependency Analysis** — Deeply analyzes `requirements.txt`, `package.json`, and other dependency files to flag heavy packages, APIs, or missing prerequisites.
-- **🤖 AI Explanation Engine** — Integrates seamlessly with local LLMs (via Ollama) or Hugging Face Cloud Inference to provide natural language explanations of the codebase, its architecture, and specific optimization tips.
+- **🤖 AI Explanation Engine** — Integrates with local LLMs (via Ollama) or Hugging Face Cloud Inference to provide natural language explanations of the codebase and optimization tips.
 - **⚡ One-Click Execution** — Generates platform-specific `setup.sh`/`run.sh` for Linux/macOS and `setup.bat`/`run.bat` for Windows.
 
 ## 🚀 How It Works
 
-1. **Provide a Repository URL**: Paste any public GitHub URL (e.g., a Streamlit app, FastAPI backend, or full-stack React Node app).
+1. **Provide a Repository**: Paste any GitHub URL, enter `owner/repo`, or browse a user's repos by entering their username.
 2. **Define Your Hardware**: Specify your RAM capacity, Operating System, and whether you have a GPU available.
 3. **Analyze**: Repo2Product AI clones the repo virtually, parses the structure, entry points, frameworks, and dependencies.
 4. **Download & Run**: A complete `.zip` package is generated with environment templates, setup scripts, and a tailored `README_ADAPTED.md`. Just run the script and watch the app start!
+5. **Optimize README** *(optional)*: Use the **README AI** tab to generate a professional, AI-improved version of the repo's README.
 
 ## 🛠️ Technology Stack
 
 Repo2Product AI is built with:
 - **Python 3.10+**
 - **Streamlit** for the interactive frontend UI
-- **Hugging Face Inference API / Ollama** for AI-driven insights
+- **Hugging Face Inference API / Ollama** for AI-driven insights and README optimization
 - Custom AST and heuristic parsers for dependency and framework detection
 
 ## 🌐 Live Demo
