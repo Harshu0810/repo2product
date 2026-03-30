@@ -271,9 +271,10 @@ class AdaptivePlanner:
                 prefix = f"cd {d_clean} && " if d_clean else ""
                 install_cmds.append(f"{prefix}npm install")
 
+        install_desc = "Install all required packages (adapted for CPU-only operation)." if not self.has_gpu else "Install all required packages."
         steps.append({
             "title": "Install Dependencies",
-            "description": "Install all required packages (adapted for CPU-only operation).",
+            "description": install_desc,
             "commands": install_cmds,
             "notes": install_notes,
         })
@@ -395,10 +396,11 @@ class AdaptivePlanner:
                 "command": f"uvicorn {module}:app --host 0.0.0.0 --port 8000 --reload",
                 "note": "API docs at http://localhost:8000/docs",
             })
+            workers = max(1, min(4, self.ram_gb // 4))
             runs.append({
                 "label": "FastAPI Server (Production)",
-                "command": f"gunicorn {module}:app -w 2 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000",
-                "note": "Use 2 workers for 8GB RAM system",
+                "command": f"gunicorn {module}:app -w {workers} -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000",
+                "note": f"Using {workers} workers for {self.ram_gb}GB RAM system",
             })
         elif "Flask" in self.frameworks:
             entry = main_entry or "app.py"
@@ -552,7 +554,9 @@ class AdaptivePlanner:
         tips = []
         dep_names = {d["name"] for d in self.deps.get("python", {}).get("all", [])}
 
-        tips.append(f"Your system: {self.ram_gb}GB RAM, CPU-only (Intel 7th Gen)")
+        gpu_status = "GPU available" if self.has_gpu else "CPU-only"
+        os_label = {"linux": "Linux", "macos": "macOS", "windows": "Windows"}.get(self.os, self.os)
+        tips.append(f"Your system: {self.ram_gb}GB RAM, {gpu_status}, {os_label}")
 
         if "torch" in dep_names:
             tips.append("Enable PyTorch CPU optimizations: `torch.set_num_threads(4)` at startup")
@@ -565,8 +569,10 @@ class AdaptivePlanner:
         if "pandas" in dep_names:
             tips.append("Use chunked reading for large files: `pd.read_csv(file, chunksize=1000)`")
 
-        tips.append("Set `OMP_NUM_THREADS=4` for optimal OpenMP performance on 4-core CPU")
-        tips.append("Use `gunicorn --workers=2` for web servers (2× CPU cores rule on 8GB RAM)")
+        omp_threads = max(2, min(8, self.ram_gb // 2))
+        tips.append(f"Set `OMP_NUM_THREADS={omp_threads}` for optimal OpenMP performance on your CPU")
+        workers = max(1, min(4, self.ram_gb // 4))
+        tips.append(f"Use `gunicorn --workers={workers}` for web servers (recommended for {self.ram_gb}GB RAM)")
         tips.append("Monitor memory: `watch -n1 free -h` to detect memory pressure")
 
         return tips

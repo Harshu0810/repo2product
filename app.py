@@ -823,7 +823,7 @@ with tab_res:
         st.markdown(f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1rem;margin:0.5rem 0">'
                     f'<div style="font-size:1.8rem;font-weight:700;color:#58a6ff;font-family:JetBrains Mono,monospace">{cpu_info.get("cores_minimum",1)}</div>'
                     f'<div style="color:#8b949e;font-size:0.78rem">Min CPU Cores</div>'
-                    f'<div style="color:#484f58;font-size:0.75rem;margin-top:0.5rem">Intel 7th Gen compatible</div></div>',
+                    f'<div style="color:#484f58;font-size:0.75rem;margin-top:0.5rem">{"GPU-enabled" if user_constraints.get("has_gpu", False) else "CPU-only"} • {user_constraints.get("os", "linux").capitalize()}</div></div>',
                     unsafe_allow_html=True)
         for note in cpu_info.get("notes", []):
             st.caption(f"• {note}")

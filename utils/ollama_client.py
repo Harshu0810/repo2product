@@ -276,7 +276,7 @@ Be concise and technical."""
 
         prompt = f"""Suggest CPU-only optimizations for a Python project:
 
-System: Intel 7th Gen CPU, {ram_gb}GB RAM, no GPU
+System: {ram_gb}GB RAM, CPU-only (no GPU)
 Frameworks: {', '.join(frameworks) or 'None'}
 Heavy packages: {', '.join(heavy_deps) or 'None'}
 
@@ -349,7 +349,7 @@ Respond with ONLY the run command(s), one per line. No explanation."""
 
     def _fallback_cpu_tips(self, frameworks: List[str], ram_gb: int) -> str:
         tips = [
-            f"1. Set OMP_NUM_THREADS=4 to optimize CPU thread usage",
+            f"1. Set OMP_NUM_THREADS={max(2, min(8, ram_gb // 2))} to optimize CPU thread usage",
             f"2. Close other applications to free RAM (you have {ram_gb}GB total)",
             "3. Use smaller model variants when available",
             "4. Enable result caching to avoid repeated computation",
