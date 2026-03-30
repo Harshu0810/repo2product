@@ -30,7 +30,7 @@ Gone are the days of struggling with broken dependencies, out-of-memory errors, 
 - **🧠 Resource-Aware Adaptation** — Tell the tool your available RAM, OS, and GPU status. It dynamically calculates optimal worker threads, memory configurations, and generates tailored run scripts.
 - **🔄 GPU-to-CPU Fallbacks** — No GPU? No problem. The system intelligently swaps GPU-bound packages for CPU-only equivalents and patches code where necessary.
 - **📝 AI README Optimizer** — Improve any repository's README with AI-powered suggestions. Uses Hugging Face Cloud or local Ollama for streaming generation.
-- **💬 AI Chat Assistant** — Engage in a localized, context-aware interactive chat to ask architecture or deployment questions about the processed codebase.
+- **💬 Interactive AI Chat** — Ask questions and converse directly with the AI about the repository's architecture, resource consumption, or dependencies.
 - **🐳 Auto-Dockerization** — Automatically generates multi-container `docker-compose.yml` and `Dockerfile` setups with appropriate exposed ports.
 - **📦 Smart Dependency Analysis** — Deeply analyzes `requirements.txt`, `package.json`, and other dependency files to flag heavy packages, APIs, or missing prerequisites.
 - **🤖 AI Explanation Engine** — Integrates with local LLMs (via Ollama) or Hugging Face Cloud Inference to provide natural language explanations of the codebase and optimization tips.

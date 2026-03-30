@@ -574,7 +574,6 @@ if analyze_btn:
         else:
             st.session_state["result"] = result
             st.session_state["constraints"] = user_constraints
-            st.session_state["chat_history"] = []
             st.rerun()
 
 
@@ -675,10 +674,19 @@ with c6:
 st.markdown("")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_ov, tab_deps, tab_res, tab_adapt, tab_plan, tab_issues, tab_dl, tab_readme_ai, tab_chat = st.tabs([
+tabs = st.tabs([
     "📊 Overview", "📦 Dependencies", "💾 Resources",
     "🔄 Adaptations", "📋 Setup Plan", "⚠️ Issues", "📥 Downloads", "📝 README AI", "💬 Chat AI"
 ])
+tab_ov = tabs[0]
+tab_deps = tabs[1]
+tab_res = tabs[2]
+tab_adapt = tabs[3]
+tab_plan = tabs[4]
+tab_issues = tabs[5]
+tab_dl = tabs[6]
+tab_readme_ai = tabs[7]
+tab_chat = tabs[8]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1273,11 +1281,11 @@ with tab_readme_ai:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TAB 9 — CHAT AI
+# TAB 9 — AI CHAT
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_chat:
-    st.markdown('<div class="section-header">💬 CHAT AI</div>', unsafe_allow_html=True)
-    st.markdown(f"Ask an AI assistant about the **{summary.get('repo_name', 'project')}** repository's architecture and setup.")
+    st.markdown('<div class="section-header">💬 CHAT WITH REPO2PRODUCT AI</div>', unsafe_allow_html=True)
+    st.markdown("Ask anything about this project's architecture, resource consumption, or dependencies.")
 
     _is_cloud = bool(os.environ.get("SPACE_ID") or os.environ.get("R2P_CLOUD"))
     _ai_use_hf = user_constraints.get("use_hf", False) or _is_cloud
@@ -1286,43 +1294,49 @@ with tab_chat:
     _ai_ollama_model = user_constraints.get("ollama_model", "llama3.2")
     _ai_ollama_url = user_constraints.get("ollama_url", "http://localhost:11434")
 
-    context_data = f"""
-    Repo Name: {summary.get('repo_name')}
-    Description: {summary.get('description')}
-    Frameworks: {', '.join(summary.get('frameworks', [])) or 'None detected'}
-    Heavy Dependencies: {', '.join(summary.get('heavy_deps', []))}
-    GPU Required: {summary.get('gpu_required_flag')}
-    Compatibility Score: {summary.get('compatibility_score')}/100 ({summary.get('compatibility_label')})
-    Risk Level: {summary.get('risk_level')}
-    Setup Run Command: {plan.get('run_commands', [{{}}])[0].get('command', 'python main.py') if plan.get('run_commands') else 'None'}
-    """
-
-    if "chat_history" not in st.session_state:
+    if "chat_history" not in st.session_state or st.session_state.get("_chat_repo") != summary.get("repo_name"):
         st.session_state.chat_history = []
-        
+        st.session_state["_chat_repo"] = summary.get("repo_name")
+
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            
+
     if prompt := st.chat_input("Ask about this repository architecture or setup..."):
         st.session_state.chat_history.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
-        
+
+        # Build context from summary dict
+        ctx = f"""
+        Repo Name: {summary.get('repo_name', 'Unknown')}
+        Description: {summary.get('description', '')[:300]}
+        Primary Language: {summary.get('language', 'Unknown')}
+        Frameworks: {', '.join(summary.get('frameworks', [])) or 'None detected'}
+        Has Tests: {summary.get('has_tests', False)} / Has Docker: {summary.get('has_docker', False)}
+
+        Hardware Constraints: {user_constraints.get('ram_gb', 8)}GB RAM, GPU Enabled: {user_constraints.get('has_gpu', False)}, OS: {user_constraints.get('os', 'linux')}
+        Total Dependencies: {summary.get('total_deps', 0)}
+        Heavy Dependencies: {', '.join(summary.get('heavy_deps', []))}
+        Predicted Critical Issues: {summary.get('critical_issues', 0)}
+        Compatibility Score: {summary.get('compatibility_score', 0)} ({summary.get('compatibility_label', '')})
+        Risk Level: {summary.get('risk_level', 'LOW')}
+        """
+
         with st.chat_message("assistant"):
             response_placeholder = st.empty()
             full_answer = ""
             for chunk in chat_stream(
                 user_query=prompt,
-                context=context_data,
+                context=ctx,
                 use_hf=_ai_use_hf,
                 hf_token=_ai_hf_token,
                 use_ollama=_ai_use_ollama,
                 ollama_model=_ai_ollama_model,
-                ollama_url=_ai_ollama_url,
+                ollama_url=_ai_ollama_url
             ):
                 full_answer += chunk
                 response_placeholder.markdown(full_answer + "▌")
             response_placeholder.markdown(full_answer)
-            
+
         st.session_state.chat_history.append({"role": "assistant", "content": full_answer})
