@@ -1244,40 +1244,49 @@ with tab_readme_ai:
             readme_content = key_files[fname]
             break
 
+    fallback_context = f"""
+    Repo Name: {summary.get('repo_name', 'Unknown')}
+    Description: {(summary.get('description') or '')[:300]}
+    Primary Language: {summary.get('language', 'Unknown')}
+    Frameworks: {', '.join(summary.get('frameworks', [])) or 'None detected'}
+    Total Dependencies: {summary.get('total_deps', 0)}
+    Has Tests: {structure.get('has_tests', False)} / Has Docker: {structure.get('has_docker', False)}
+    """
+
     if readme_content:
         with st.expander("📄 Current README (click to expand)", expanded=False):
             st.markdown(readme_content[:5000])
 
-        if st.button("⚡ Optimize README with AI", type="primary", use_container_width=True):
-            st.markdown("---")
-            st.markdown("### ✨ Improved README")
-            improved_container = st.empty()
-            full_text = ""
-            for chunk in improve_readme_stream(
-                readme_content,
-                use_hf=_ai_use_hf,
-                hf_token=_ai_hf_token,
-                use_ollama=_ai_use_ollama,
-                ollama_model=_ai_ollama_model,
-                ollama_url=_ai_ollama_url,
-            ):
-                full_text += chunk
-                improved_container.markdown(full_text + "▌")
-            improved_container.markdown(full_text)
+    btn_label = "⚡ Optimize README with AI" if readme_content and len(readme_content.strip()) > 50 else "⚡ Generate README with AI"
+    if st.button(btn_label, type="primary", use_container_width=True):
+        st.markdown("---")
+        st.markdown("### ✨ Generated README")
+        improved_container = st.empty()
+        full_text = ""
+        for chunk in improve_readme_stream(
+            readme_content,
+            repo_context=fallback_context,
+            use_hf=_ai_use_hf,
+            hf_token=_ai_hf_token,
+            use_ollama=_ai_use_ollama,
+            ollama_model=_ai_ollama_model,
+            ollama_url=_ai_ollama_url,
+        ):
+            full_text += chunk
+            improved_container.markdown(full_text + "▌")
+        improved_container.markdown(full_text)
 
-            if full_text and not full_text.startswith("Error") and not full_text.startswith("⚠️"):
-                st.session_state["_optimized_readme"] = full_text
+        if full_text and not full_text.startswith("Error") and not full_text.startswith("⚠️"):
+            st.session_state["_optimized_readme"] = full_text
 
-        if "_optimized_readme" in st.session_state:
-            st.download_button(
-                "📥 Download Improved README",
-                st.session_state["_optimized_readme"],
-                file_name="README_IMPROVED.md",
-                mime="text/markdown",
-                use_container_width=True,
-            )
-    else:
-        st.info("No README found in this repository. The README optimizer works on repos that have an existing README file.")
+    if "_optimized_readme" in st.session_state:
+        st.download_button(
+            "📥 Download Generated README",
+            st.session_state["_optimized_readme"],
+            file_name="README_IMPROVED.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1310,7 +1319,7 @@ with tab_chat:
         # Build context from summary dict
         ctx = f"""
         Repo Name: {summary.get('repo_name', 'Unknown')}
-        Description: {summary.get('description', '')[:300]}
+        Description: {(summary.get('description') or '')[:300]}
         Primary Language: {summary.get('language', 'Unknown')}
         Frameworks: {', '.join(summary.get('frameworks', [])) or 'None detected'}
         Has Tests: {summary.get('has_tests', False)} / Has Docker: {summary.get('has_docker', False)}

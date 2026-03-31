@@ -15,6 +15,7 @@ CLOUD_MODE = bool(os.environ.get("SPACE_ID") or os.environ.get("R2P_CLOUD"))
 
 def improve_readme_stream(
     readme_text: str,
+    repo_context: str = "",
     use_hf: bool = False,
     hf_token: str = "",
     use_ollama: bool = False,
@@ -22,19 +23,32 @@ def improve_readme_stream(
     ollama_url: str = "http://localhost:11434",
 ) -> Generator[str, None, None]:
     """
-    Stream an AI-improved version of the given README text.
+    Stream an AI-improved or generated version of the given README text.
     Picks the right backend based on flags (HuggingFace cloud or local Ollama).
     """
-    if not readme_text or not readme_text.strip():
-        yield "No README content provided."
-        return
+    safe_text = str(readme_text)[:2000] if readme_text else ""
 
-    # Truncate to prevent stalling on CPU / cloud free-tier
-    safe_text = str(readme_text)[:2000]
+    if len(safe_text.strip()) < 50:
+        # Generate from scratch primarily using context if README is empty or very short
+        prompt = f"""You are an expert technical writer. Create a professional, well-structured, and developer-friendly README for the following repository.
+Use the provided repository context to generate the content. Include standard sections (Overview, Features, Installation, Usage).
+Output ONLY the generated README in markdown.
 
-    prompt = f"""You are an expert technical writer. Improve the following README to make it professional, well-structured, and developer-friendly.
+Repository Context:
+{repo_context}
+
+---
+Generated README:
+"""
+    else:
+        # Improve existing README
+        prompt = f"""You are an expert technical writer. Improve the following README to make it professional, well-structured, and developer-friendly.
 Add clear standard sections (Overview, Features, Installation, Usage, Contributing, License) if missing.
+Incorporate any useful details from the repository context below.
 Preserve all factual content. Do not complain about truncated text. Output ONLY the improved README in markdown.
+
+Repository Context:
+{repo_context}
 
 Original README:
 {safe_text}
