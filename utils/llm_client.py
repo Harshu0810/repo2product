@@ -245,18 +245,6 @@ class OllamaStatus:
 
     @staticmethod
     def get_status(base_url: str = OLLAMA_BASE_URL) -> Dict[str, Any]:
-        if CLOUD_MODE:
-            # There is no Ollama inside the Space container, and probing
-            # localhost there just adds latency to every run.
-            return {
-                "running": False,
-                "url": base_url,
-                "models": [],
-                "best_model": "",
-                "model_count": 0,
-                "status_text": "Unavailable in cloud mode — Ollama is a local-only backend",
-            }
-
         client = LLMClient(provider="ollama", base_url=base_url)
         is_running = client.is_available()
         models = client._available_models if is_running else []
@@ -273,6 +261,6 @@ class OllamaStatus:
             "model_count": len(models),
             "status_text": (
                 f"✅ Running — {len(models)} model(s) available" if is_running
-                else "❌ Not running — start with: ollama serve"
+                else f"❌ Not running at {base_url}"
             ),
         }

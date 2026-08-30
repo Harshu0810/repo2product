@@ -181,7 +181,8 @@ class Repo2ProductPipeline:
             self.progress("✅ Artifacts generated", 95)
 
             # ── Stage 9: AI Explanation (optional) ─────────────────
-            ollama_status = OllamaStatus.get_status()
+            ollama_url = constraints.get("ollama_url") or "http://localhost:11434"
+            ollama_status = OllamaStatus.get_status(ollama_url)
             result["ollama_status"] = ollama_status
 
             wants_ollama = bool(constraints.get("use_ollama"))
@@ -201,8 +202,10 @@ class Repo2ProductPipeline:
                     hf_token = constraints.get("hf_token", "")
                     llm = LLMClient(provider="huggingface", api_key=hf_token)
                 else:
-                    llm = LLMClient(provider="ollama", model=ollama_status.get("best_model", "llama3.2"))
-                    llm.auto_select_model()
+                    target_model = constraints.get("ollama_model") or ollama_status.get("best_model", "llama3.2")
+                    llm = LLMClient(provider="ollama", base_url=ollama_url, model=target_model)
+                    if not constraints.get("ollama_model"):
+                        llm.auto_select_model()
 
                 explanation = llm.explain_repo(structure, fetch_result.get("metadata", {}))
                 cpu_tips = llm.suggest_cpu_optimizations(

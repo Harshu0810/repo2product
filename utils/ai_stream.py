@@ -58,7 +58,7 @@ def stream_completion(
     an error explaining that nothing is configured.
     """
     # ── HuggingFace Cloud ──────────────────────────────────────────────
-    if use_hf or (CLOUD_MODE and not use_ollama):
+    if use_hf:
         try:
             from huggingface_hub import InferenceClient
         except ImportError:
@@ -78,7 +78,7 @@ def stream_completion(
             )
         return
 
-    # ── Local Ollama ───────────────────────────────────────────────────
+    # ── Local / Remote Ollama ──────────────────────────────────────────
     if use_ollama:
         try:
             import ollama as ollama_lib

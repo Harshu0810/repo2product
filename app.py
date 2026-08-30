@@ -438,13 +438,8 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### 🤖 AI Explanation Engine")
-    # In cloud mode (HF Spaces) there is no local Ollama to talk to.
-    if CLOUD_MODE:
-        ai_options = ["None", "Hugging Face (Cloud)"]
-        ai_default = 1
-    else:
-        ai_options = ["None", "Ollama (Local)", "Hugging Face (Cloud)"]
-        ai_default = 0
+    ai_options = ["None", "Ollama (Local / Remote)", "Hugging Face (Cloud)"]
+    ai_default = 2 if CLOUD_MODE else 0
     ai_engine = st.radio("Provider", ai_options, index=ai_default, label_visibility="collapsed")
     
     use_ollama = False
@@ -453,19 +448,19 @@ with st.sidebar:
     ollama_model = "llama3.2"
     ollama_url = "http://localhost:11434"
 
-    if ai_engine == "Ollama (Local)":
+    if ai_engine == "Ollama (Local / Remote)":
         use_ollama = True
-        ollama_url = st.text_input("Ollama URL", value="http://localhost:11434")
+        ollama_url = st.text_input("Ollama URL", value="http://localhost:11434", help="Local or remote Ollama server URL (e.g. http://localhost:11434, https://your-tunnel.ngrok.app)")
         ollama_status_data = OllamaStatus.get_status(ollama_url)
         if ollama_status_data["running"]:
             st.success(f"✅ Connected — {ollama_status_data['model_count']} model(s)")
             if ollama_status_data["models"]:
                 ollama_model = st.selectbox("Model", ollama_status_data["models"])
             else:
-                st.warning("No models — run: `ollama pull llama3.2`")
+                ollama_model = st.text_input("Model Name", value="llama3.2")
         else:
-            st.error("❌ Not running — start: `ollama serve`")
-            ollama_url = "http://localhost:11434"
+            st.warning(f"⚠️ Not connected to {ollama_url} — make sure Ollama is running or tunnel is active")
+            ollama_model = st.text_input("Model Name", value="llama3.2")
     elif ai_engine == "Hugging Face (Cloud)":
         use_hf = True
         st.info(f"Uses `{HF_DEFAULT_MODEL.split('/')[-1]}` via the free Serverless Inference API")
@@ -1263,7 +1258,7 @@ with tab_readme_ai:
     st.markdown('<div class="section-header">📝 AI README OPTIMIZER</div>', unsafe_allow_html=True)
     st.markdown("Improve any repository's README with AI — powered by your selected AI engine.")
 
-    _ai_use_hf = user_constraints.get("use_hf", False) or CLOUD_MODE
+    _ai_use_hf = user_constraints.get("use_hf", False)
     _ai_use_ollama = user_constraints.get("use_ollama", False)
     _ai_hf_token = user_constraints.get("hf_token", "")
     _ai_ollama_model = user_constraints.get("ollama_model", "llama3.2")
@@ -1335,7 +1330,7 @@ with tab_chat:
     st.markdown('<div class="section-header">💬 CHAT WITH REPO2PRODUCT AI</div>', unsafe_allow_html=True)
     st.markdown("Ask anything about this project's architecture, resource consumption, or dependencies.")
 
-    _ai_use_hf = user_constraints.get("use_hf", False) or CLOUD_MODE
+    _ai_use_hf = user_constraints.get("use_hf", False)
     _ai_use_ollama = user_constraints.get("use_ollama", False)
     _ai_hf_token = user_constraints.get("hf_token", "")
     _ai_ollama_model = user_constraints.get("ollama_model", "llama3.2")
