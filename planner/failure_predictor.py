@@ -4,14 +4,13 @@ Pre-flight failure prediction engine. Checks for common setup issues
 before the user attempts to run the project.
 """
 
-import re
 import os
-import sys
-import subprocess
-import shutil
+import re
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import logging
+
+from utils.runtime import CLOUD_MODE
 
 logger = logging.getLogger(__name__)
 
@@ -108,23 +107,60 @@ class FailurePredictor:
         }
 
     # ------------------------------------------------------------------ #
+    #  Target-environment helpers                                          #
+    # ------------------------------------------------------------------ #
+
+    def _target_python(self) -> Optional[Tuple[int, int]]:
+        """
+        The Python version the *user* will run the project on, as declared in
+        the sidebar. Never `sys.version_info` — that is the version of the
+        server rendering this app, which tells us nothing about the user's box.
+        """
+        declared = str(self.constraints.get("python_version", "") or "")
+        return self._parse_version(declared)
+
+    @staticmethod
+    def _parse_version(value: str) -> Optional[Tuple[int, int]]:
+        parts = re.findall(r"\d+", value or "")
+        if not parts:
+            return None
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        return (major, minor)
+
+    def _required_python(self) -> Optional[Tuple[int, int]]:
+        """Minimum Python the project itself declares, if any."""
+        req = self.deps.get("python_requirement", {}) or {}
+        return self._parse_version(req.get("minimum", ""))
+
+    # ------------------------------------------------------------------ #
     #  Individual checks                                                   #
     # ------------------------------------------------------------------ #
 
     def _check_python_version(self):
-        current = f"{sys.version_info.major}.{sys.version_info.minor}"
-        required = self.constraints.get("python_version", "3.8")
-        try:
-            req_major, req_minor = map(int, required.split(".")[:2])
-            if sys.version_info < (req_major, req_minor):
-                self.predictions.append(FailurePrediction(
-                    level="critical",
-                    category="python_version",
-                    message=f"Python {current} detected but {required}+ required",
-                    fix=f"Install Python {required}: pyenv install {required} or download from python.org",
-                ))
-        except Exception:
-            pass
+        target = self._target_python()
+        required = self._required_python()
+        if not target or not required:
+            return
+
+        req = self.deps.get("python_requirement", {}) or {}
+        declared = req.get("declared", ".".join(str(p) for p in required))
+        source = req.get("source", "the project manifest")
+        target_str = ".".join(str(p) for p in target)
+
+        if target < required:
+            self.predictions.append(FailurePrediction(
+                level="critical",
+                category="python_version",
+                message=(
+                    f"Project requires Python {declared} (from {source}) "
+                    f"but you selected {target_str}"
+                ),
+                fix=(
+                    f"Install a newer Python: `pyenv install {declared.lstrip('>=~^ ')}` "
+                    f"or download it from python.org, then recreate the venv"
+                ),
+            ))
 
     def _check_missing_entry_points(self):
         entries = self.structure.get("entry_points", [])
@@ -137,17 +173,21 @@ class FailurePredictor:
                 message="No standard entry point detected (main.py, app.py, etc.)",
                 fix="Review the README to find the correct startup command",
             ))
-        else:
-            for ep in entries:
-                if ep["path"] not in file_list and self.local_path:
-                    full = self.local_path / ep["path"]
-                    if not full.exists():
-                        self.predictions.append(FailurePrediction(
-                            level="critical",
-                            category="entry_point",
-                            message=f"Entry point '{ep['path']}' not found in repo",
-                            fix="Check the repository — file may have been moved or renamed",
-                        ))
+            return
+
+        for ep in entries:
+            if ep["path"] in file_list:
+                continue
+            # Not in the listing. With a local clone we can confirm on disk;
+            # in API-only mode the tree listing *is* the source of truth.
+            if self.local_path and (self.local_path / ep["path"]).exists():
+                continue
+            self.predictions.append(FailurePrediction(
+                level="critical",
+                category="entry_point",
+                message=f"Entry point '{ep['path']}' not found in repo",
+                fix="Check the repository — file may have been moved or renamed",
+            ))
 
     def _check_gpu_only_packages(self):
         gpu_required = self.deps.get("summary", {}).get("gpu_required", [])
@@ -168,20 +208,27 @@ class FailurePredictor:
         if not env_vars:
             return
 
-        missing = []
-        for var, default in env_vars.items():
-            # Check if it's a required API key
-            if "KEY" in var or "SECRET" in var or "TOKEN" in var:
-                env_val = os.environ.get(var, "")
-                if not env_val:
-                    missing.append(var)
+        secretish = [v for v in env_vars
+                     if "KEY" in v or "SECRET" in v or "TOKEN" in v or "PASSWORD" in v]
+        if not secretish:
+            return
+
+        if CLOUD_MODE:
+            # We are running on a shared server. os.environ here belongs to the
+            # Space container, not to the person downloading the package, so
+            # every secret is "missing" as far as they are concerned.
+            missing = secretish
+        else:
+            missing = [v for v in secretish if not os.environ.get(v)]
 
         if missing:
+            shown = ", ".join(missing[:5])
+            extra = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
             self.predictions.append(FailurePrediction(
                 level="warning",
                 category="env_variables",
-                message=f"Missing environment variables: {', '.join(missing[:5])}",
-                fix="Add these to your .env file before running",
+                message=f"Secrets referenced by the code must be provided: {shown}{extra}",
+                fix="Copy .env.template to .env and fill in these values before running",
             ))
 
     def _check_api_keys_without_alternatives(self):
@@ -199,7 +246,7 @@ class FailurePredictor:
 
     def _check_conflicting_dependencies(self):
         """Detect known version conflicts."""
-        python_deps = {d["name"]: d.get("version", "any") for d in self.deps.get("python", {}).get("all", [])}
+        python_deps = {d["name"] for d in self.deps.get("python", {}).get("all", [])}
 
         KNOWN_CONFLICTS = [
             ("torch", "tensorflow", "PyTorch and TensorFlow may conflict — install in separate venvs"),
@@ -247,37 +294,56 @@ class FailurePredictor:
             ))
 
         disk_gb = est.get("estimated_disk_gb", 0)
-        if disk_gb > 30:  # User has 40GB disk
+        disk_budget = self.constraints.get("disk_gb")
+        if disk_budget:
+            if disk_gb > disk_budget * 0.9:
+                self.predictions.append(FailurePrediction(
+                    level="critical",
+                    category="disk",
+                    message=f"Installation needs ~{disk_gb}GB but only {disk_budget}GB is free",
+                    fix="Free up disk space, or install to a separate drive with `pip install --target`",
+                ))
+            elif disk_gb > disk_budget * 0.7:
+                self.predictions.append(FailurePrediction(
+                    level="warning",
+                    category="disk",
+                    message=f"Installation needs ~{disk_gb}GB of your {disk_budget}GB free space",
+                    fix="Clear the pip cache first: `pip cache purge`",
+                ))
+        elif disk_gb > 10:
             self.predictions.append(FailurePrediction(
                 level="warning",
                 category="disk",
                 message=f"Installation requires ~{disk_gb}GB disk space",
-                fix="Free up disk space or install to a separate drive",
+                fix="Check free space with `df -h .` before installing",
             ))
 
     def _check_missing_system_deps(self):
-        system_deps = self.deps.get("system", [])
-        python_deps = {d["name"] for d in self.deps.get("python", {}).get("all", [])}
+        python_deps = {d["name"].lower() for d in self.deps.get("python", {}).get("all", [])}
 
-        # Check for packages needing system libs
+        # Packages that build from C sources when no wheel matches the host.
+        # Keys are already in the detector's normalized (lower-case) form.
         SYSTEM_LIB_REQUIREMENTS = {
-            "psycopg2": ("libpq-dev", "PostgreSQL dev library"),
-            "Pillow": ("libjpeg-dev zlib1g-dev", "Image processing libraries"),
+            "psycopg2": ("libpq-dev", "PostgreSQL client library"),
+            "mysqlclient": ("default-libmysqlclient-dev", "MySQL client library"),
+            "pillow": ("libjpeg-dev zlib1g-dev", "JPEG/PNG codecs"),
             "lxml": ("libxml2-dev libxslt-dev", "XML processing libraries"),
-            "cryptography": ("libssl-dev libffi-dev", "Crypto libraries"),
+            "cryptography": ("libssl-dev libffi-dev", "OpenSSL and libffi"),
+            "pyaudio": ("portaudio19-dev", "PortAudio headers"),
+            "opencv-python": ("libgl1 libglib2.0-0", "OpenGL/GLib runtime for cv2"),
         }
 
         for dep, (sys_pkg, desc) in SYSTEM_LIB_REQUIREMENTS.items():
-            if dep.lower() in python_deps:
+            if dep in python_deps:
                 self.predictions.append(FailurePrediction(
                     level="info",
                     category="system_library",
-                    message=f"'{dep}' may need system library: {sys_pkg}",
-                    fix=f"sudo apt install {sys_pkg}  # {desc}",
+                    message=f"'{dep}' needs {desc} if pip has to build it from source",
+                    fix=f"On Debian/Ubuntu: sudo apt install {sys_pkg}",
                 ))
 
     def _check_port_conflicts(self):
-        """Check if common ports are already in use."""
+        """Check whether the ports this project wants are already taken."""
         frameworks = self.structure.get("frameworks", [])
         fw_names = {fw["name"] for fw in frameworks}
 
@@ -289,21 +355,41 @@ class FailurePredictor:
             "Gradio": 7860,
         }
 
-        for fw, port in PORT_MAP.items():
-            if fw in fw_names:
-                if self._is_port_in_use(port):
-                    self.predictions.append(FailurePrediction(
-                        level="warning",
-                        category="port_conflict",
-                        message=f"Port {port} ({fw}) may already be in use",
-                        fix=f"Kill the process: `lsof -i :{port} | awk 'NR>1 {{print $2}}' | xargs kill`",
-                    ))
+        wanted = sorted({port for fw, port in PORT_MAP.items() if fw in fw_names})
+        if not wanted:
+            return
+
+        if CLOUD_MODE:
+            # A socket probe here would test the Space container, not the
+            # machine that will actually run the project. Advise instead.
+            ports = ", ".join(str(p) for p in wanted)
+            self.predictions.append(FailurePrediction(
+                level="info",
+                category="port_conflict",
+                message=f"This project binds port(s) {ports} — make sure they are free locally",
+                fix=f"Check with: `lsof -i :{wanted[0]}` (macOS/Linux) or "
+                    f"`netstat -ano | findstr :{wanted[0]}` (Windows)",
+            ))
+            return
+
+        for port in wanted:
+            if self._is_port_in_use(port):
+                self.predictions.append(FailurePrediction(
+                    level="warning",
+                    category="port_conflict",
+                    message=f"Port {port} is already in use on this machine",
+                    fix=f"Kill the process: `lsof -ti :{port} | xargs kill` "
+                        f"or run the app on a different port",
+                ))
 
     def _is_port_in_use(self, port: int) -> bool:
+        if CLOUD_MODE:
+            return False
         try:
             import socket
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                return s.connect_ex(("localhost", port)) == 0
+                s.settimeout(0.25)
+                return s.connect_ex(("127.0.0.1", port)) == 0
         except Exception:
             return False
 
@@ -332,46 +418,59 @@ class FailurePredictor:
             ))
 
     def _check_file_permissions(self):
-        if not self.local_path:
+        # The exec bit only exists on POSIX filesystems. On Windows
+        # os.access(path, X_OK) is true for every readable file, so the check
+        # would report nothing and mean nothing.
+        if not self.local_path or os.name == "nt":
             return
-        scripts = self.structure.get("script_files", [])
-        for script in scripts:
+        for script in self.structure.get("script_files", []):
             full = self.local_path / script
-            if full.suffix in (".sh",) and full.exists():
-                if not os.access(full, os.X_OK):
-                    self.predictions.append(FailurePrediction(
-                        level="warning",
-                        category="permissions",
-                        message=f"Script '{script}' not executable",
-                        fix=f"Run: chmod +x {script}",
-                        auto_fixable=True,
-                    ))
+            if full.suffix != ".sh" or not full.is_file():
+                continue
+            if not full.stat().st_mode & 0o111:
+                self.predictions.append(FailurePrediction(
+                    level="warning",
+                    category="permissions",
+                    message=f"Script '{script}' is not executable",
+                    fix=f"Run: chmod +x {script}",
+                    auto_fixable=True,
+                ))
 
     def _check_ollama_availability(self):
-        """Check if Ollama is needed and available."""
+        """Flag Ollama as a prerequisite when the plan depends on it."""
         fw_names = {fw["name"] for fw in self.structure.get("frameworks", [])}
         use_ollama = self.constraints.get("use_ollama", False)
         has_ollama_replacement = any(
             r.get("replacement") == "ollama (local)"
             for r in self.adaptation.get("package_replacements", [])
         )
+        if not (fw_names & {"Ollama"} or use_ollama or has_ollama_replacement):
+            return
 
-        if ("Ollama" in fw_names or use_ollama or has_ollama_replacement):
-            # Try to connect to Ollama
-            if not self._ollama_running():
-                self.predictions.append(FailurePrediction(
-                    level="warning",
-                    category="ollama",
-                    message="Ollama server not running",
-                    fix="Start Ollama: `ollama serve` in a separate terminal",
-                ))
-            else:
-                self.predictions.append(FailurePrediction(
-                    level="info",
-                    category="ollama",
-                    message="Ollama server is running ✓",
-                    fix="",
-                ))
+        if CLOUD_MODE:
+            # Probing 127.0.0.1:11434 from the Space would describe the
+            # container, never the user's laptop.
+            self.predictions.append(FailurePrediction(
+                level="info",
+                category="ollama",
+                message="This project uses Ollama for local inference",
+                fix="Install it from ollama.com, then run `ollama serve` "
+                    "and pull a model (e.g. `ollama pull llama3`)",
+            ))
+        elif self._ollama_running():
+            self.predictions.append(FailurePrediction(
+                level="info",
+                category="ollama",
+                message="Ollama server is running (OK)",
+                fix="",
+            ))
+        else:
+            self.predictions.append(FailurePrediction(
+                level="warning",
+                category="ollama",
+                message="Ollama server not running",
+                fix="Start Ollama: `ollama serve` in a separate terminal",
+            ))
 
     def _ollama_running(self) -> bool:
         return self._is_port_in_use(11434)
@@ -395,21 +494,24 @@ class FailurePredictor:
             ))
 
     def _check_version_incompatibilities(self):
-        python_deps = {d["name"]: d.get("version", "any") for d in self.deps.get("python", {}).get("all", [])}
-        py_ver = sys.version_info
+        python_deps = {d["name"] for d in self.deps.get("python", {}).get("all", [])}
+        target = self._target_python()
+        if not target:
+            return
+        target_str = ".".join(str(p) for p in target)
 
         PYTHON_INCOMPATIBILITIES = [
-            ("torch", (3, 12), "PyTorch support for Python 3.12 is limited in older versions"),
-            ("tensorflow", (3, 12), "TensorFlow may have issues with Python 3.12"),
+            ("torch", (3, 13), "PyTorch wheels for 3.13+ lag behind releases"),
+            ("tensorflow", (3, 13), "TensorFlow has no 3.13 wheels on all platforms yet"),
         ]
 
-        for pkg, max_py, msg in PYTHON_INCOMPATIBILITIES:
-            if pkg in python_deps and py_ver >= max_py:
+        for pkg, min_broken, msg in PYTHON_INCOMPATIBILITIES:
+            if pkg in python_deps and target >= min_broken:
                 self.predictions.append(FailurePrediction(
                     level="warning",
                     category="version_compat",
-                    message=f"Python {py_ver.major}.{py_ver.minor} may have compatibility issues with '{pkg}'",
-                    fix=f"{msg}. Consider using Python 3.10 or 3.11",
+                    message=f"Python {target_str} may not have prebuilt '{pkg}' wheels",
+                    fix=f"{msg}. Consider Python 3.11 or 3.12 for this project",
                 ))
 
     # ------------------------------------------------------------------ #

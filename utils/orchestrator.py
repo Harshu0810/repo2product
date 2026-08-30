@@ -5,7 +5,6 @@ Returns a unified analysis result used by the Streamlit UI.
 """
 
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Dict, Any, Optional, Callable
@@ -18,10 +17,9 @@ from planner.adaptive_planner import AdaptivePlanner
 from planner.failure_predictor import FailurePredictor
 from generator.setup_generator import SetupGenerator
 from utils.llm_client import LLMClient, OllamaStatus
+from utils.runtime import CLOUD_MODE, default_output_dir
 
 logger = logging.getLogger(__name__)
-
-CLOUD_MODE = bool(os.environ.get("SPACE_ID") or os.environ.get("R2P_CLOUD"))
 
 DEFAULT_CONSTRAINTS = {
     "ram_gb": 8,
@@ -40,6 +38,12 @@ class Repo2ProductPipeline:
     End-to-end pipeline: URL → Analysis → Adaptation → Plan → Artifacts
     """
 
+    # Order in which run() populates result["stages"], used to name a failing stage.
+    STAGE_ORDER = (
+        "fetch", "structure", "dependencies", "resources", "adaptation",
+        "plan", "predictions", "artifacts", "ai_explanation",
+    )
+
     def __init__(
         self,
         output_dir: Optional[str] = None,
@@ -47,8 +51,8 @@ class Repo2ProductPipeline:
         progress_callback: Optional[Callable[[str, int], None]] = None,
     ):
         if output_dir is None:
-            output_dir = "/tmp/repo2product_output" if CLOUD_MODE else "./output"
-            
+            output_dir = default_output_dir()
+
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.github_token = github_token
@@ -91,9 +95,15 @@ class Repo2ProductPipeline:
             parser = RepoStructureParser(
                 local_path=fetch_result.get("local_path"),
                 file_list=fetch_result.get("file_list", []),
+                key_files=fetch_result.get("key_files", {}),
             )
             structure = parser.analyze()
             result["stages"]["structure"] = structure
+            if structure.get("analysis_depth") == "partial":
+                result["warnings"].append(
+                    "Analysed over the GitHub API without a local clone: framework and "
+                    "code-level detection is based on key files only."
+                )
             self.progress("✅ Structure analyzed", 35)
 
             # ── Stage 3: Dependency Detection ──────────────────────────
@@ -131,8 +141,8 @@ class Repo2ProductPipeline:
                 user_constraints=constraints,
             )
             plan = planner.generate_plan()
-            plan_text = planner.generate_full_plan()
-            plan["full_plan_text"] = plan_text
+            # generate_full_plan() reuses the cached plan rather than re-deriving it.
+            plan["full_plan_text"] = planner.generate_full_plan()
             result["stages"]["plan"] = plan
             self.progress("✅ Setup plan generated", 80)
 
@@ -161,6 +171,7 @@ class Repo2ProductPipeline:
                 output_dir=str(self.output_dir),
             )
             artifacts = generator.generate_all()
+            # generate_zip() packs the already-rendered artifacts; it does not re-render.
             zip_path = generator.generate_zip()
             result["stages"]["artifacts"] = {
                 "files": {k: v for k, v in artifacts.items() if k != "_output_dir"},
@@ -172,10 +183,17 @@ class Repo2ProductPipeline:
             # ── Stage 9: AI Explanation (optional) ─────────────────
             ollama_status = OllamaStatus.get_status()
             result["ollama_status"] = ollama_status
-            
-            use_ollama = constraints.get("use_ollama") and ollama_status["running"]
-            use_hf = constraints.get("use_hf")
-            
+
+            wants_ollama = bool(constraints.get("use_ollama"))
+            use_ollama = wants_ollama and ollama_status["running"]
+            use_hf = bool(constraints.get("use_hf"))
+
+            if wants_ollama and not use_ollama:
+                # Don't silently skip the stage the user explicitly asked for.
+                result["warnings"].append(
+                    f"AI explanation skipped: {ollama_status['status_text']}"
+                )
+
             if use_ollama or use_hf:
                 self.progress("🤖 Generating AI explanation...", 96)
                 
@@ -195,7 +213,7 @@ class Repo2ProductPipeline:
                 result["stages"]["ai_explanation"] = {
                     "repo_explanation": explanation,
                     "cpu_optimizations": cpu_tips,
-                    "model_used": llm.model if use_ollama else "Mistral-7B-Instruct (Cloud)",
+                    "model_used": llm.resolved_model(),
                 }
 
             # ── Finalize ───────────────────────────────────────────────
@@ -210,8 +228,12 @@ class Repo2ProductPipeline:
             logger.error(f"Fetch error: {e}")
             self.progress(f"❌ Error: {e}", 0)
         except Exception as e:
-            result["errors"].append({"stage": "unknown", "error": str(e)})
-            logger.exception(f"Pipeline error: {e}")
+            # Name the stage that failed instead of reporting "unknown": the first
+            # stage with no recorded output is the one that raised.
+            completed = set(result["stages"])
+            failed = next((s for s in self.STAGE_ORDER if s not in completed), "finalize")
+            result["errors"].append({"stage": failed, "error": str(e)})
+            logger.exception(f"Pipeline error during '{failed}': {e}")
             self.progress(f"❌ Error: {e}", 0)
 
         return result

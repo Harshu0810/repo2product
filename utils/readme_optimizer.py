@@ -1,16 +1,19 @@
 """
 utils/readme_optimizer.py — Repo2Product AI
-AI-powered README optimizer. Streams improved README via HuggingFace Cloud or local Ollama.
-Adapted from DevBrain AI's readme_optimizer module.
+AI-powered README optimizer. Streams an improved README via HuggingFace Cloud or local Ollama.
+Backend routing lives in utils/ai_stream.py.
 """
 
-import os
 import logging
 from typing import Generator
 
+from utils.ai_stream import CLOUD_MODE, stream_completion  # noqa: F401  (CLOUD_MODE re-exported)
+
 logger = logging.getLogger(__name__)
 
-CLOUD_MODE = bool(os.environ.get("SPACE_ID") or os.environ.get("R2P_CLOUD"))
+# Long enough for a real project README; short enough to stay inside the model's
+# context alongside the repo context block and the generated output.
+MAX_README_CHARS = 12000
 
 
 def improve_readme_stream(
@@ -24,9 +27,15 @@ def improve_readme_stream(
 ) -> Generator[str, None, None]:
     """
     Stream an AI-improved or generated version of the given README text.
-    Picks the right backend based on flags (HuggingFace cloud or local Ollama).
+
+    Failures are yielded with utils.ai_stream.ERROR_PREFIX so the caller can tell
+    them apart from generated markdown.
     """
-    safe_text = str(readme_text)[:2000] if readme_text else ""
+    original = str(readme_text) if readme_text else ""
+    safe_text = original[:MAX_README_CHARS]
+    truncated = len(original) > MAX_README_CHARS
+    if truncated:
+        logger.info(f"README truncated for prompting: {len(original)} → {MAX_README_CHARS} chars")
 
     if len(safe_text.strip()) < 50:
         # Generate from scratch primarily using context if README is empty or very short
@@ -41,12 +50,16 @@ Repository Context:
 Generated README:
 """
     else:
+        truncation_note = (
+            "\nNote: the original README was truncated for length. Improve what is shown and do "
+            "not invent content for the omitted part.\n" if truncated else ""
+        )
         # Improve existing README
         prompt = f"""You are an expert technical writer. Improve the following README to make it professional, well-structured, and developer-friendly.
 Add clear standard sections (Overview, Features, Installation, Usage, Contributing, License) if missing.
 Incorporate any useful details from the repository context below.
 Preserve all factual content. Do not complain about truncated text. Output ONLY the improved README in markdown.
-
+{truncation_note}
 Repository Context:
 {repo_context}
 
@@ -56,37 +69,14 @@ Original README:
 ---
 Improved README:
 """
-    messages = [{"role": "user", "content": prompt}]
 
-    # ── HuggingFace Cloud ──────────────────────────────────────────────
-    if use_hf or (CLOUD_MODE and not use_ollama):
-        try:
-            from huggingface_hub import InferenceClient
-            token = hf_token or os.environ.get("HF_TOKEN", "")
-            client = InferenceClient("meta-llama/Meta-Llama-3-8B-Instruct", token=token)
-            for message in client.chat_completion(messages=messages, stream=True, max_tokens=1000):
-                yield message.choices[0].delta.content or ""
-        except ImportError:
-            yield "Error: `huggingface_hub` is not installed. Run: `pip install huggingface_hub`"
-        except Exception as e:
-            yield f"Error calling Hugging Face API: {e}. Ensure HF_TOKEN is set in your Space Settings → Secrets."
-        return
-
-    # ── Local Ollama ───────────────────────────────────────────────────
-    if use_ollama:
-        try:
-            import ollama as ollama_lib
-            response = ollama_lib.chat(model=ollama_model, messages=messages, stream=True)
-            for chunk in response:
-                yield chunk['message']['content']
-        except ImportError:
-            yield "Error: `ollama` package not installed. Run: `pip install ollama`"
-        except Exception as e:
-            if "connection" in str(e).lower():
-                yield "Error: Could not connect to Ollama. Ensure it is running (`ollama serve`)."
-            else:
-                yield f"Error calling Ollama: {e}"
-        return
-
-    # ── No AI engine selected ──────────────────────────────────────────
-    yield "⚠️ No AI engine configured. Enable **Hugging Face (Cloud)** or **Ollama (Local)** in the sidebar to use README optimization."
+    yield from stream_completion(
+        messages=[{"role": "user", "content": prompt}],
+        use_hf=use_hf,
+        hf_token=hf_token,
+        use_ollama=use_ollama,
+        ollama_model=ollama_model,
+        ollama_url=ollama_url,
+        max_tokens=2000,
+        no_engine_hint="README optimization",
+    )

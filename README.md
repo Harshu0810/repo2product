@@ -28,7 +28,7 @@ Gone are the days of struggling with broken dependencies, out-of-memory errors, 
 
 - **🔗 Smart Repo Input** — Enter a full URL (`https://github.com/owner/repo`), a bare `owner/repo`, or just a GitHub **username** to browse and select from their public repositories.
 - **🧠 Resource-Aware Adaptation** — Tell the tool your available RAM, OS, and GPU status. It dynamically calculates optimal worker threads, memory configurations, and generates tailored run scripts.
-- **🔄 GPU-to-CPU Fallbacks** — No GPU? No problem. The system intelligently swaps GPU-bound packages for CPU-only equivalents and patches code where necessary.
+- **🔄 GPU-to-CPU Fallbacks** — No GPU? No problem. The system intelligently swaps GPU-bound packages for CPU-only equivalents in the adapted requirements, and surfaces ready-to-apply regex patches for the GPU-specific code it finds.
 - **📝 AI README Optimizer** — Improve any repository's README with AI-powered suggestions. Uses Hugging Face Cloud or local Ollama for streaming generation.
 - **💬 Interactive AI Chat** — Ask questions and converse directly with the AI about the repository's architecture, resource consumption, or dependencies.
 - **🐳 Auto-Dockerization** — Automatically generates multi-container `docker-compose.yml` and `Dockerfile` setups with appropriate exposed ports.
@@ -83,4 +83,4 @@ Contributions, issues, and feature requests are welcome! Feel free to check the 
 
 ## 📝 License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.

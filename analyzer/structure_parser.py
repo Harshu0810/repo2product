@@ -7,10 +7,9 @@ framework detection, entry points, and AST-based Python analysis.
 import ast
 import json
 import re
-import os
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Set, Tuple
-from collections import defaultdict, Counter
+from typing import Dict, List, Optional, Any, Set
+from collections import Counter
 import logging
 
 logger = logging.getLogger(__name__)
@@ -165,11 +164,35 @@ class RepoStructureParser:
     """
     Parses a cloned (or API-listed) repository and extracts structural,
     linguistic, framework, and entry-point information.
+
+    Works in two depths:
+      * "full"    — a local clone is available, so every source file can be read.
+      * "partial" — API-only (cloud) mode: analysis runs against the `key_files`
+                    contents the fetcher downloaded. Fewer files, but framework
+                    detection, env extraction and AST analysis still run, which
+                    keeps the hosted app from silently degrading to a
+                    language-only guess.
     """
 
-    def __init__(self, local_path: Optional[str] = None, file_list: Optional[list] = None):
+    # Extensions worth reading for pattern matching / AST work.
+    SOURCE_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx"}
+
+    # Manifests that declare dependencies — a strong framework signal that is
+    # available even when there is no clone.
+    MANIFEST_NAMES = {
+        "requirements.txt", "pipfile", "pyproject.toml", "setup.py", "setup.cfg",
+        "package.json", "environment.yml", "environment.yaml",
+    }
+
+    def __init__(
+        self,
+        local_path: Optional[str] = None,
+        file_list: Optional[list] = None,
+        key_files: Optional[Dict[str, str]] = None,
+    ):
         self.local_path = Path(local_path) if local_path else None
         self.file_list: List[str] = file_list or []
+        self.key_files: Dict[str, str] = key_files or {}
         self._analysis_cache: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------ #
@@ -184,6 +207,8 @@ class RepoStructureParser:
         files = self.file_list
         if self.local_path and self.local_path.exists():
             files = self._scan_files()
+
+        has_clone = bool(self.local_path and self.local_path.exists())
 
         result = {
             "file_count": len(files),
@@ -204,6 +229,7 @@ class RepoStructureParser:
             "api_definitions": self._find_api_definitions(files),
             "env_variables": {},
             "ast_insights": {},
+            "analysis_depth": "full" if has_clone else "partial",
         }
 
         # Primary language
@@ -212,16 +238,45 @@ class RepoStructureParser:
                 result["languages"], key=result["languages"].get
             )
 
-        # Framework detection needs file content
-        if self.local_path:
-            result["frameworks"] = self._detect_frameworks(files)
-            result["env_variables"] = self._extract_env_variables(files)
-            result["ast_insights"] = self._python_ast_analysis(files)
+        # Content-based analysis. Reads the clone when there is one, otherwise the
+        # key files fetched over the API — never skipped outright.
+        result["frameworks"] = self._detect_frameworks(files)
+        result["env_variables"] = self._extract_env_variables(files)
+        result["ast_insights"] = self._python_ast_analysis(files)
 
         result["project_type"] = self._determine_project_type(result)
 
         self._analysis_cache = result
         return result
+
+    # ------------------------------------------------------------------ #
+    #  Content access (clone or API key files)                             #
+    # ------------------------------------------------------------------ #
+
+    def _read_file(self, rel_path: str, max_bytes: int) -> Optional[str]:
+        """Read a repo-relative file from the clone, falling back to key_files."""
+        if self.local_path:
+            full = self.local_path / rel_path
+            try:
+                if full.is_file():
+                    with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                        return fh.read(max_bytes)
+            except Exception:
+                pass
+        content = self.key_files.get(rel_path)
+        return content[:max_bytes] if content is not None else None
+
+    def _readable_files(self, files: List[str], suffixes: Set[str]) -> List[str]:
+        """
+        Candidate paths whose content we can actually obtain, in a stable order.
+
+        With a clone that is every matching file; without one it is limited to
+        whatever the fetcher downloaded into key_files.
+        """
+        if self.local_path:
+            return [f for f in files if Path(f).suffix.lower() in suffixes]
+        return [f for f in self.key_files if Path(f).suffix.lower() in suffixes]
+
 
     # ------------------------------------------------------------------ #
     #  Language detection                                                  #
@@ -252,9 +307,17 @@ class RepoStructureParser:
                 parts = parts[:max_depth] + ("...",)
             node = tree
             for part in parts[:-1]:
-                node = node.setdefault(part, {})
+                child = node.get(part)
+                if not isinstance(child, dict):
+                    # Either unseen, or previously recorded as a leaf: a directory
+                    # always wins so a same-named file can't erase a subtree.
+                    child = {}
+                    node[part] = child
+                node = child
             leaf = parts[-1] if parts else f
-            node[leaf] = None  # leaf node
+            # Don't overwrite an existing subtree with a leaf marker.
+            if not isinstance(node.get(leaf), dict):
+                node[leaf] = None  # leaf node
         return tree
 
     def _tree_to_string(self, tree: Dict, prefix: str = "", depth: int = 0) -> str:
@@ -310,25 +373,39 @@ class RepoStructureParser:
         file_names = {Path(f).name for f in files}
 
         # Content to search (sample Python and JS files)
-        content_samples = self._sample_source_content(files, max_files=40)
+        content_samples = self._sample_source_content(files)
+        declared = self._declared_packages()
 
         for fw_name, sig in FRAMEWORK_SIGNATURES.items():
             confidence = 0
             evidence = []
 
-            # File existence check
+            # File existence check — strongest signal, works without any content.
             for req_file in sig.get("files", []):
                 if req_file in file_names:
                     confidence += 40
                     evidence.append(f"Found file: {req_file}")
 
-            # Pattern matching in source
+            # Declared as a dependency in a manifest. Available in API-only mode,
+            # where the source sample may be small or empty.
+            for imp in sig.get("imports", []):
+                if imp.lower() in declared:
+                    confidence += 35
+                    evidence.append(f"Declared dependency: {imp.lower()}")
+                    break
+
+            # Pattern matching in source. Score per distinct pattern, and give a
+            # small bump for patterns seen across several files, so one incidental
+            # match no longer looks the same as pervasive use.
             for pattern in sig.get("patterns", []):
-                for content in content_samples.values():
-                    if re.search(pattern, content):
-                        confidence += 30
-                        evidence.append(f"Pattern matched: {pattern[:50]}")
-                        break
+                try:
+                    hits = sum(1 for content in content_samples.values() if re.search(pattern, content))
+                except re.error:
+                    logger.debug(f"Invalid framework pattern for {fw_name}: {pattern}")
+                    continue
+                if hits:
+                    confidence += 30 + min((hits - 1) * 5, 15)
+                    evidence.append(f"Pattern matched in {hits} file(s): {pattern[:50]}")
 
             if confidence >= 30:
                 fw_info = {
@@ -347,24 +424,62 @@ class RepoStructureParser:
         detected.sort(key=lambda x: x["confidence"], reverse=True)
         return detected
 
-    def _sample_source_content(self, files: List[str], max_files: int = 40) -> Dict[str, str]:
-        """Read a sample of source files for pattern matching."""
-        if not self.local_path:
-            return {}
-        content = {}
-        exts = {".py", ".js", ".ts", ".jsx", ".tsx"}
-        count = 0
-        for f in files:
-            if count >= max_files:
-                break
-            if Path(f).suffix in exts:
-                full = self.local_path / f
+    def _declared_packages(self) -> Set[str]:
+        """
+        Lowercased package names declared in whatever manifests we can read.
+
+        Deliberately lightweight — DependencyDetector does the thorough job later;
+        here we only need enough to recognise a framework by name, including in
+        API-only mode where the source sample is limited to key files.
+        """
+        names: Set[str] = set()
+        candidates = [f for f in (self.key_files or {}) if Path(f).name.lower() in self.MANIFEST_NAMES]
+        if self.local_path:
+            candidates += [f for f in self.file_list if Path(f).name.lower() in self.MANIFEST_NAMES]
+
+        # Matches a distribution name at the head of a line in requirements.txt
+        # ("pkg==1.0", "pkg[extra]>=2 ; marker"), Pipfile / Poetry ('pkg = "^1.0"')
+        # and PEP 621 / setup.py arrays ('"pkg>=1.0",'). Three chars minimum so
+        # short import aliases such as "tf" can't be matched by accident.
+        entry_re = re.compile(r'^["\']?([A-Za-z][A-Za-z0-9._-]{2,60})["\']?\s*(?:[=<>!~;,\[\]"\']|$)')
+
+        for rel in dict.fromkeys(candidates):
+            content = self._read_file(rel, 60_000)
+            if not content:
+                continue
+            if Path(rel).name.lower() == "package.json":
                 try:
-                    with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                        content[f] = fh.read(10_000)
-                    count += 1
-                except Exception:
-                    pass
+                    data = json.loads(content)
+                except (ValueError, TypeError):
+                    continue
+                for section in ("dependencies", "devDependencies", "peerDependencies"):
+                    for pkg in (data.get(section) or {}):
+                        names.add(str(pkg).lower().lstrip("@").split("/")[0])
+                continue
+
+            for raw in content.splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                match = entry_re.match(line)
+                if match:
+                    names.add(match.group(1).lower())
+        return names
+
+    def _sample_source_content(self, files: List[str], max_files: int = 120) -> Dict[str, str]:
+        """
+        Read a sample of source files for pattern matching.
+
+        With a clone this samples up to `max_files` source files; without one it
+        falls back to the source files present in key_files (main.py, app.py,
+        settings.py, …) so cloud runs still get real signal.
+        """
+        content = {}
+        candidates = self._readable_files(files, self.SOURCE_EXTENSIONS)
+        for f in candidates[:max_files]:
+            text = self._read_file(f, 10_000)
+            if text is not None:
+                content[f] = text
         return content
 
     # ------------------------------------------------------------------ #
@@ -375,34 +490,31 @@ class RepoStructureParser:
         """Extract required env variables from .env.example and source."""
         env_vars: Dict[str, str] = {}
 
-        # From .env.example
-        for f in files:
-            fname = Path(f).name
-            if fname in (".env.example", ".env.sample", ".env.template"):
-                full = self.local_path / f
-                try:
-                    with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                        for line in fh:
-                            line = line.strip()
-                            if line and not line.startswith("#") and "=" in line:
-                                key, _, val = line.partition("=")
-                                env_vars[key.strip()] = val.strip()
-                except Exception:
-                    pass
+        # From .env.example — read via _read_file so this also works API-only,
+        # where the fetcher has already downloaded the example env file.
+        env_names = (".env.example", ".env.sample", ".env.template")
+        env_candidates = [f for f in files if Path(f).name in env_names]
+        env_candidates += [f for f in self.key_files if Path(f).name in env_names]
+        for f in dict.fromkeys(env_candidates):
+            content = self._read_file(f, 20_000)
+            if not content:
+                continue
+            for line in content.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, val = line.partition("=")
+                    env_vars[key.strip()] = val.strip()
 
         # Scan source for os.environ / os.getenv patterns
-        pattern = re.compile(r'os\.(?:environ\.get|getenv)\(["\']([A-Z_][A-Z0-9_]*)["\']')
-        for f in files:
-            if Path(f).suffix == ".py":
-                full = self.local_path / f
-                try:
-                    with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                        for match in pattern.finditer(fh.read(20_000)):
-                            key = match.group(1)
-                            if key not in env_vars:
-                                env_vars[key] = "<required>"
-                except Exception:
-                    pass
+        pattern = re.compile(r'os\.(?:environ\.get|getenv)\(["\']([A-Z_][A-Z0-9_]*)["\']|os\.environ\[["\']([A-Z_][A-Z0-9_]*)["\']\]')
+        for f in self._readable_files(files, {".py"}):
+            content = self._read_file(f, 20_000)
+            if not content:
+                continue
+            for match in pattern.finditer(content):
+                key = match.group(1) or match.group(2)
+                if key and key not in env_vars:
+                    env_vars[key] = "<required>"
 
         return env_vars
 
@@ -422,22 +534,22 @@ class RepoStructureParser:
             "decorators": Counter(),
         }
 
-        py_files = [f for f in files if Path(f).suffix == ".py"][:50]
+        py_files = self._readable_files(files, {".py"})[:50]
 
         for f in py_files:
-            if not self.local_path:
+            source = self._read_file(f, 100_000)
+            if not source:
                 continue
-            full = self.local_path / f
             try:
-                with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                    source = fh.read(100_000)
-                tree = ast.parse(source, filename=str(full))
+                tree = ast.parse(source, filename=f)
                 self._walk_ast(tree, insights, f)
             except SyntaxError:
+                # Truncated reads and Python-2 sources are both expected here.
                 pass
             except Exception as e:
                 logger.debug(f"AST parse error {f}: {e}")
 
+        insights["files_parsed"] = len(py_files)
         insights["top_imports"] = dict(insights["imports"].most_common(20))
         insights["top_decorators"] = dict(insights["decorators"].most_common(10))
         del insights["imports"]

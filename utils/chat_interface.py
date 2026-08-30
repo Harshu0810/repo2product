@@ -1,16 +1,17 @@
 """
 utils/chat_interface.py — Repo2Product AI
 Maintains an AI-driven chat streaming session context for analyzing repositories.
-Combines logic from `devbrain_ai/chat/interface.py` with Repo2Product architecture contexts.
+Backend routing lives in utils/ai_stream.py so Chat AI, README AI and the
+AI-explanation stage all talk to the same model through the same API.
 """
 
-import os
 import logging
 from typing import Generator
 
+from utils.ai_stream import CLOUD_MODE, stream_completion  # noqa: F401  (CLOUD_MODE re-exported)
+
 logger = logging.getLogger(__name__)
 
-CLOUD_MODE = bool(os.environ.get("SPACE_ID") or os.environ.get("R2P_CLOUD"))
 
 def chat_stream(
     user_query: str,
@@ -19,10 +20,13 @@ def chat_stream(
     hf_token: str = "",
     use_ollama: bool = False,
     ollama_model: str = "llama3.2",
-    ollama_url: str = "http://localhost:11434"
+    ollama_url: str = "http://localhost:11434",
 ) -> Generator[str, None, None]:
     """
-    Stream a localized AI response analyzing the selected software repository framework/setup.
+    Stream an AI response analyzing the selected software repository framework/setup.
+
+    Failures are yielded with utils.ai_stream.ERROR_PREFIX; use `is_error()` on the
+    accumulated text to render them as errors rather than as assistant output.
     """
     prompt = f"""You are Repo2Product AI, an expert software architecture assistant analyzing a GitHub repository designed to be packaged and run.
 Here are the explicit technical details and constraints of the analyzed project setup:
@@ -33,37 +37,13 @@ Respond directly to the user's question, referencing the provided context (such 
 User: {user_query}
 Assistant:"""
 
-    messages = [{"role": "user", "content": prompt}]
-
-    # ── HuggingFace Cloud ──────────────────────────────────────────────
-    if use_hf or (CLOUD_MODE and not use_ollama):
-        try:
-            from huggingface_hub import InferenceClient
-            token = hf_token or os.environ.get("HF_TOKEN", "")
-            client = InferenceClient("meta-llama/Meta-Llama-3-8B-Instruct", token=token)
-            for message in client.chat_completion(messages=messages, stream=True, max_tokens=1000):
-                yield message.choices[0].delta.content or ""
-        except ImportError:
-            yield "Error: `huggingface_hub` is not installed. Run: `pip install huggingface_hub`"
-        except Exception as e:
-            yield f"Error calling Hugging Face API: {e}. Ensure HF_TOKEN is set in your Space Settings → Secrets."
-        return
-
-    # ── Local Ollama ───────────────────────────────────────────────────
-    if use_ollama:
-        try:
-            import ollama as ollama_lib
-            response = ollama_lib.chat(model=ollama_model, messages=messages, stream=True)
-            for chunk in response:
-                yield chunk['message']['content']
-        except ImportError:
-            yield "Error: `ollama` package not installed. Run: `pip install ollama`"
-        except Exception as e:
-            if "connection" in str(e).lower():
-                yield "Error: Could not connect to Ollama. Ensure it is running (`ollama serve`)."
-            else:
-                yield f"Error calling Ollama: {e}"
-        return
-
-    # ── No AI engine selected ──────────────────────────────────────────
-    yield "⚠️ No AI engine configured. Enable **Hugging Face (Cloud)** or **Ollama (Local)** in the sidebar to use Chat AI."
+    yield from stream_completion(
+        messages=[{"role": "user", "content": prompt}],
+        use_hf=use_hf,
+        hf_token=hf_token,
+        use_ollama=use_ollama,
+        ollama_model=ollama_model,
+        ollama_url=ollama_url,
+        max_tokens=1000,
+        no_engine_hint="Chat AI",
+    )

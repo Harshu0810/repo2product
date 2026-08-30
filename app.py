@@ -9,11 +9,23 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 
 import streamlit as st
-import time
+import html
 from pathlib import Path
 from analyzer.repo_fetcher import RepoFetcher
+from utils.runtime import CLOUD_MODE
+from utils.ai_stream import HF_DEFAULT_MODEL, is_error as ai_is_error, error_message as ai_error_message
 from utils.readme_optimizer import improve_readme_stream
 from utils.chat_interface import chat_stream
+
+
+def esc(value) -> str:
+    """
+    Escape untrusted text before it lands in an f-string with
+    unsafe_allow_html=True. Repo names, descriptions, topics, owner logins and
+    dependency names all come straight from the GitHub API and from files in
+    the analyzed repository, so any of them can contain markup.
+    """
+    return html.escape("" if value is None else str(value), quote=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config (must be first Streamlit call)
@@ -75,6 +87,8 @@ st.markdown("""
     --r2p-chip-bg: #eef1f5;
     --r2p-chip-color: #0969da;
     --r2p-chip-border: #d0d7de;
+    --r2p-tag-gpu-bg: rgba(207,34,46,0.1);
+    --r2p-tag-api-bg: rgba(191,135,0,0.12);
 }
 
 /* Dark theme (Streamlit's data-theme or browser preference) */
@@ -120,6 +134,8 @@ st.markdown("""
         --r2p-chip-bg: #1f2937;
         --r2p-chip-color: #93c5fd;
         --r2p-chip-border: #374151;
+        --r2p-tag-gpu-bg: rgba(248,81,73,0.15);
+        --r2p-tag-api-bg: rgba(210,153,34,0.15);
     }
 }
 
@@ -143,6 +159,7 @@ st.markdown("""
     --r2p-adapt-replace-bg: rgba(88,166,255,0.08); --r2p-adapt-replace-border: #1d4f8e;
     --r2p-adapt-remove-bg: rgba(248,81,73,0.08); --r2p-adapt-remove-border: #6e2020;
     --r2p-chip-bg: #1f2937; --r2p-chip-color: #93c5fd; --r2p-chip-border: #374151;
+    --r2p-tag-gpu-bg: rgba(248,81,73,0.15); --r2p-tag-api-bg: rgba(210,153,34,0.15);
 }
 
 /* ── Animations ───────────────────────────────────────────────────────── */
@@ -255,8 +272,8 @@ code, pre { font-family: 'JetBrains Mono', monospace !important; }
     font-size: 10px; font-family: 'JetBrains Mono', monospace;
     font-weight: 600; margin-left: 4px;
 }
-.tag-gpu { background: rgba(var(--r2p-red), 0.1); color: var(--r2p-red); }
-.tag-api { background: rgba(var(--r2p-orange), 0.1); color: var(--r2p-orange); }
+.tag-gpu { background: var(--r2p-tag-gpu-bg); color: var(--r2p-red); }
+.tag-api { background: var(--r2p-tag-api-bg); color: var(--r2p-orange); }
 .tag-heavy { color: var(--r2p-red); }
 .tag-local { color: var(--r2p-green); }
 
@@ -407,6 +424,8 @@ with st.sidebar:
 
     ram_gb = st.select_slider("Available RAM", options=[2,4,6,8,12,16,32,64], value=8,
                                format_func=lambda x: f"{x} GB")
+    disk_gb = st.select_slider("Free Disk Space", options=[5,10,20,40,80,160,320], value=40,
+                                format_func=lambda x: f"{x} GB")
     os_choice = st.selectbox("Operating System", ["linux","macos","windows"],
                               format_func=lambda x: {"linux":"🐧 Linux","macos":"🍎 macOS","windows":"🪟 Windows"}[x])
     has_gpu = st.toggle("GPU Available", value=False)
@@ -415,14 +434,12 @@ with st.sidebar:
     else:
         st.info("CPU-only — project adapted automatically")
 
-    python_version = st.selectbox("Python Version", ["3.8","3.9","3.10","3.11","3.12"], index=2)
+    python_version = st.selectbox("Python Version", ["3.8","3.9","3.10","3.11","3.12","3.13"], index=2)
 
     st.divider()
     st.markdown("### 🤖 AI Explanation Engine")
-    # In cloud mode (HF Spaces), hide Ollama option
-    import os as _os
-    _is_cloud = bool(_os.environ.get("SPACE_ID") or _os.environ.get("R2P_CLOUD"))
-    if _is_cloud:
+    # In cloud mode (HF Spaces) there is no local Ollama to talk to.
+    if CLOUD_MODE:
         ai_options = ["None", "Hugging Face (Cloud)"]
         ai_default = 1
     else:
@@ -451,7 +468,7 @@ with st.sidebar:
             ollama_url = "http://localhost:11434"
     elif ai_engine == "Hugging Face (Cloud)":
         use_hf = True
-        st.info("Uses Mistral-7B-Instruct via the free Serverless Inference API")
+        st.info(f"Uses `{HF_DEFAULT_MODEL.split('/')[-1]}` via the free Serverless Inference API")
         hf_token = st.text_input("HF API Token (Optional)", type="password", placeholder="hf_xxxx")
 
     st.divider()
@@ -511,9 +528,18 @@ else:
         with st.spinner("Fetching repositories..."):
             _fetcher = RepoFetcher(github_token=github_token or None)
             user_repos = _fetcher.fetch_user_repos(gh_username.strip())
+            list_error = getattr(_fetcher, "last_repo_list_error", None)
             if user_repos:
                 st.session_state["_browse_repos"] = user_repos
                 st.session_state["_browse_user"] = gh_username.strip()
+                if list_error:
+                    # A mid-pagination failure returns a partial list; saying
+                    # nothing would make a truncated list look complete.
+                    st.warning(
+                        f"Showing {len(user_repos)} repos — the listing stopped early: {list_error}"
+                    )
+            elif list_error:
+                st.error(f"Could not list repos for **{gh_username}**: {list_error}")
             else:
                 st.warning(f"No public repos found for **{gh_username}**. Check the username.")
 
@@ -540,7 +566,7 @@ if analyze_btn:
         st.warning("Please enter a GitHub repository URL")
     else:
         user_constraints = {
-            "ram_gb": ram_gb, "os": os_choice, "has_gpu": has_gpu,
+            "ram_gb": ram_gb, "disk_gb": disk_gb, "os": os_choice, "has_gpu": has_gpu,
             "python_version": python_version, "use_ollama": use_ollama,
             "use_hf": use_hf, "hf_token": hf_token,
             "ollama_model": ollama_model, "ollama_url": ollama_url,
@@ -552,12 +578,12 @@ if analyze_btn:
         def on_progress(msg, pct):
             prog_bar.progress(pct)
             prog_text.markdown(
-                f"<span style='color:#8b949e;font-family:JetBrains Mono,monospace;font-size:0.82rem'>{msg}</span>",
+                f"<span style='color:#8b949e;font-family:JetBrains Mono,monospace;font-size:0.82rem'>{esc(msg)}</span>",
                 unsafe_allow_html=True)
-            time.sleep(0.03)
 
+        # output_dir is left unset so the pipeline picks a writable location
+        # (a temp dir on read-only cloud filesystems).
         pipeline = Repo2ProductPipeline(
-            output_dir="./output",
             github_token=github_token or None,
             progress_callback=on_progress,
         )
@@ -618,7 +644,9 @@ if "result" not in st.session_state:
     """, unsafe_allow_html=True)
     st.stop()
 
-result = st.session_state["result"]
+result = st.session_state.get("result")
+if not result:
+    st.stop()
 user_constraints = st.session_state.get("constraints", {})
 summary = result.get("summary", {})
 stages = result.get("stages", {})
@@ -638,6 +666,9 @@ artifact_files = artifacts.get("files", {})
 # ── Elapsed time banner ────────────────────────────────────────────────────
 elapsed = result.get("elapsed_seconds", 0)
 st.success(f"✅ Analysis complete in **{elapsed}s** — {summary.get('repo_name', '')}")
+
+for _w in result.get("warnings", []):
+    st.warning(f"⚠️ {_w}")
 
 
 # ── Score strip ───────────────────────────────────────────────────────────────
@@ -700,7 +731,7 @@ with tab_ov:
 
         fws = summary.get("frameworks", [])
         if fws:
-            chips = " ".join(f'<span class="fw-chip">{fw}</span>' for fw in fws)
+            chips = " ".join(f'<span class="fw-chip">{esc(fw)}</span>' for fw in fws)
             st.markdown(chips, unsafe_allow_html=True)
         st.markdown("")
 
@@ -741,7 +772,7 @@ with tab_ov:
         st.markdown(f"""
         <div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1rem">
             <div style="font-size:2.2rem;font-weight:700;color:{sc2};font-family:'JetBrains Mono',monospace">{score}/100</div>
-            <div style="color:#8b949e;font-size:0.82rem;margin-top:0.2rem">{adaptation.get("compatibility_label","")}</div>
+            <div style="color:#8b949e;font-size:0.82rem;margin-top:0.2rem">{esc(adaptation.get("compatibility_label",""))}</div>
             <div style="margin-top:0.6rem;font-size:0.8rem">
                 <span style="color:#3fb950">✓ {adaptation.get("summary",{}).get("packages_replaced",0)} replaced</span> &nbsp;
                 <span style="color:#f85149">✗ {adaptation.get("summary",{}).get("packages_removed",0)} removed</span>
@@ -761,7 +792,7 @@ with tab_ov:
         )
         tree = parser.get_tree_string()
         if tree:
-            st.markdown(f'<div class="tree-view">{tree[:3000]}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="tree-view">{esc(tree[:3000])}</div>', unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -793,8 +824,8 @@ with tab_deps:
             st.markdown(
                 f'<div style="padding:4px 0;border-bottom:1px solid #21262d;font-size:0.82rem">'
                 f'<span style="color:{wclr};font-family:JetBrains Mono,monospace">◆</span> '
-                f'<span style="color:#e6edf3;font-family:JetBrains Mono,monospace">{dep["name"]}</span>'
-                f'<span style="color:#484f58">{" "+ver if ver and ver!="any" else ""}{ram_s}</span> {tags}</div>',
+                f'<span style="color:#e6edf3;font-family:JetBrains Mono,monospace">{esc(dep["name"])}</span>'
+                f'<span style="color:#484f58">{esc(" "+ver if ver and ver!="any" else "")}{ram_s}</span> {tags}</div>',
                 unsafe_allow_html=True)
 
     with col_r:
@@ -803,8 +834,8 @@ with tab_deps:
             st.markdown('<div class="section-header">⚠️ HEAVY PACKAGES</div>', unsafe_allow_html=True)
             for pkg in heavy:
                 d = next((x for x in python_deps if x["name"]==pkg), {})
-                st.markdown(f'<div class="issue-warning"><div class="issue-title">🔴 {pkg} ({fmt_size(d.get("ram_mb",0))})</div>'
-                            f'<div class="issue-fix">{d.get("note","High resource usage")}</div></div>',
+                st.markdown(f'<div class="issue-warning"><div class="issue-title">🔴 {esc(pkg)} ({fmt_size(d.get("ram_mb",0))})</div>'
+                            f'<div class="issue-fix">{esc(d.get("note") or "High resource usage")}</div></div>',
                             unsafe_allow_html=True)
 
         api_deps = dep_summary.get("api_key_required", [])
@@ -813,8 +844,8 @@ with tab_deps:
             for pkg in api_deps:
                 d = next((x for x in python_deps if x["name"]==pkg), {})
                 alts = d.get("alternatives", [])
-                st.markdown(f'<div class="issue-warning"><div class="issue-title">🔑 {pkg}</div>'
-                            f'<div class="issue-fix">Alternatives: {", ".join(alts) or "Ollama (local)"}</div></div>',
+                st.markdown(f'<div class="issue-warning"><div class="issue-title">🔑 {esc(pkg)}</div>'
+                            f'<div class="issue-fix">Alternatives: {esc(", ".join(alts) or "Ollama (local)")}</div></div>',
                             unsafe_allow_html=True)
 
         node_deps = dep_analysis.get("node", {})
@@ -822,7 +853,7 @@ with tab_deps:
             st.markdown('<div class="section-header">NODE.JS DEPENDENCIES</div>', unsafe_allow_html=True)
             for dep in node_deps["dependencies"][:12]:
                 st.markdown(f'<div style="font-size:0.78rem;font-family:JetBrains Mono,monospace;color:#8b949e;padding:2px 0">'
-                            f'📦 {dep["name"]} <span style="color:#484f58">{dep["version"]}</span></div>',
+                            f'📦 {esc(dep["name"])} <span style="color:#484f58">{esc(dep["version"])}</span></div>',
                             unsafe_allow_html=True)
 
         docker_info = dep_analysis.get("docker", {})
@@ -861,15 +892,18 @@ with tab_res:
     with c2:
         st.markdown("#### 💿 Disk")
         disk_gb = disk_info.get("install_gb", 0)
-        dclr = "#3fb950" if disk_gb<10 else "#d29922" if disk_gb<20 else "#f85149"
+        usr_disk = user_constraints.get("disk_gb", 40)
+        dclr = ("#3fb950" if disk_gb <= usr_disk*0.5
+                else "#d29922" if disk_gb <= usr_disk*0.8 else "#f85149")
         st.markdown(f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1rem;margin:0.5rem 0">'
                     f'<div style="font-size:1.8rem;font-weight:700;color:{dclr};font-family:JetBrains Mono,monospace">{disk_gb} GB</div>'
                     f'<div style="color:#8b949e;font-size:0.78rem">Install Footprint</div>'
                     f'<div style="color:#484f58;font-size:0.75rem;margin-top:0.5rem">'
                     f'Deps: {fmt_size(disk_info.get("install_mb",0))}<br>'
-                    f'Available: <span style="color:#58a6ff">40 GB</span></div></div>',
+                    f'Available: <span style="color:#58a6ff">{usr_disk} GB</span></div></div>',
                     unsafe_allow_html=True)
-        st.progress(min(disk_gb/40,1.0), text=f"{disk_gb}GB of 40GB disk")
+        dfill = min(disk_gb/usr_disk, 1.0) if usr_disk else 0
+        st.progress(dfill, text=f"{disk_gb}GB of {usr_disk}GB free disk")
 
     with c3:
         st.markdown("#### 🖥️ CPU")
@@ -923,14 +957,14 @@ with tab_adapt:
             if replacements:
                 st.markdown('<div class="section-header">📦 PACKAGE REPLACEMENTS</div>', unsafe_allow_html=True)
                 for rep in replacements:
-                    ic = f'<br><span style="color:#58a6ff;font-size:0.72rem">$ pip install {rep.get("install_cmd", rep.get("replacement",""))}</span>' if rep.get("install_cmd") else ""
-                    cc = f'<br><span style="color:#8b949e;font-size:0.72rem">Code: {rep.get("code_change","")}</span>' if rep.get("code_change") else ""
+                    ic = f'<br><span style="color:#58a6ff;font-size:0.72rem">$ pip install {esc(rep.get("install_cmd") or rep.get("replacement",""))}</span>' if rep.get("install_cmd") else ""
+                    cc = f'<br><span style="color:#8b949e;font-size:0.72rem">Code: {esc(rep.get("code_change",""))}</span>' if rep.get("code_change") else ""
                     st.markdown(
                         f'<div class="adapt-replace">'
-                        f'<span style="color:#f85149;font-family:JetBrains Mono,monospace">{rep["original"]}</span>'
+                        f'<span style="color:#f85149;font-family:JetBrains Mono,monospace">{esc(rep["original"])}</span>'
                         f'<span style="color:#484f58"> → </span>'
-                        f'<span style="color:#3fb950;font-family:JetBrains Mono,monospace">{rep["replacement"]}</span>'
-                        f'<br><span style="color:#8b949e;font-size:0.72rem">{rep.get("note",rep.get("reason",""))}</span>'
+                        f'<span style="color:#3fb950;font-family:JetBrains Mono,monospace">{esc(rep["replacement"])}</span>'
+                        f'<br><span style="color:#8b949e;font-size:0.72rem">{esc(rep.get("note") or rep.get("reason",""))}</span>'
                         f'{ic}{cc}</div>', unsafe_allow_html=True)
 
             if removed:
@@ -938,9 +972,9 @@ with tab_adapt:
                 for rem in removed:
                     st.markdown(
                         f'<div class="adapt-remove">'
-                        f'<span style="color:#f85149;font-family:JetBrains Mono,monospace;text-decoration:line-through">{rem["package"]}</span>'
-                        f'<br><span style="color:#8b949e;font-size:0.72rem">Reason: {rem.get("reason","GPU-only")}</span>'
-                        f'<br><span style="color:#d29922;font-size:0.72rem">Impact: {rem.get("impact","Feature disabled")}</span>'
+                        f'<span style="color:#f85149;font-family:JetBrains Mono,monospace;text-decoration:line-through">{esc(rem["package"])}</span>'
+                        f'<br><span style="color:#8b949e;font-size:0.72rem">Reason: {esc(rem.get("reason") or "GPU-only")}</span>'
+                        f'<br><span style="color:#d29922;font-size:0.72rem">Impact: {esc(rem.get("impact") or "Feature disabled")}</span>'
                         f'</div>', unsafe_allow_html=True)
 
         with col_r:
@@ -960,9 +994,9 @@ with tab_adapt:
                 for feat in dis_features:
                     st.markdown(
                         f'<div class="issue-warning">'
-                        f'<div class="issue-title">🚫 {feat["feature"]}</div>'
-                        f'<div class="issue-fix">Reason: {feat["reason"]}</div>'
-                        f'<div class="issue-fix">Workaround: {feat.get("workaround","Remove usage")}</div>'
+                        f'<div class="issue-title">🚫 {esc(feat["feature"])}</div>'
+                        f'<div class="issue-fix">Reason: {esc(feat["reason"])}</div>'
+                        f'<div class="issue-fix">Workaround: {esc(feat.get("workaround") or "Remove usage")}</div>'
                         f'</div>', unsafe_allow_html=True)
 
             if env_changes:
@@ -1069,29 +1103,29 @@ with tab_issues:
     if criticals:
         st.markdown('<div class="section-header">🔴 CRITICAL ISSUES</div>', unsafe_allow_html=True)
         for p in criticals:
-            fix_html = f'<div class="issue-fix">Fix: {p["fix"]}</div>' if p.get("fix") else ""
+            fix_html = f'<div class="issue-fix">Fix: {esc(p["fix"])}</div>' if p.get("fix") else ""
             auto = ' <span style="color:#3fb950;font-size:0.7rem">[auto-fixable]</span>' if p.get("auto_fixable") else ""
             st.markdown(
                 f'<div class="issue-critical">'
-                f'<div class="issue-title">🔴 [{p["category"]}] {p["message"]}{auto}</div>'
+                f'<div class="issue-title">🔴 [{esc(p["category"])}] {esc(p["message"])}{auto}</div>'
                 f'{fix_html}</div>', unsafe_allow_html=True)
 
     if warnings:
         st.markdown('<div class="section-header">🟡 WARNINGS</div>', unsafe_allow_html=True)
         for p in warnings:
-            fix_html = f'<div class="issue-fix">Fix: {p["fix"]}</div>' if p.get("fix") else ""
+            fix_html = f'<div class="issue-fix">Fix: {esc(p["fix"])}</div>' if p.get("fix") else ""
             st.markdown(
                 f'<div class="issue-warning">'
-                f'<div class="issue-title">⚠️ [{p["category"]}] {p["message"]}</div>'
+                f'<div class="issue-title">⚠️ [{esc(p["category"])}] {esc(p["message"])}</div>'
                 f'{fix_html}</div>', unsafe_allow_html=True)
 
     if infos:
         st.markdown('<div class="section-header">🔵 INFO</div>', unsafe_allow_html=True)
         for p in infos:
-            fix_html = f'<div class="issue-fix">{p["fix"]}</div>' if p.get("fix") else ""
+            fix_html = f'<div class="issue-fix">{esc(p["fix"])}</div>' if p.get("fix") else ""
             st.markdown(
                 f'<div class="issue-info">'
-                f'<div class="issue-title">ℹ️ [{p["category"]}] {p["message"]}</div>'
+                f'<div class="issue-title">ℹ️ [{esc(p["category"])}] {esc(p["message"])}</div>'
                 f'{fix_html}</div>', unsafe_allow_html=True)
 
     checklist = predictions.get("pre_run_checklist", [])
@@ -1102,7 +1136,7 @@ with tab_issues:
             st.markdown(
                 f'<div class="checklist-item">'
                 f'<span>{req_badge}</span>'
-                f'<span style="color:#e6edf3">{item["item"]}</span>'
+                f'<span style="color:#e6edf3">{esc(item["item"])}</span>'
                 f'</div>', unsafe_allow_html=True)
 
     # Flagged dep issues
@@ -1112,10 +1146,10 @@ with tab_issues:
         for iss in flagged:
             sev = iss.get("severity","info")
             cls = {"error":"issue-critical","warning":"issue-warning","info":"issue-info"}.get(sev,"issue-info")
-            fix_html = f'<div class="issue-fix">Fix: {iss["fix"]}</div>' if iss.get("fix") else ""
+            fix_html = f'<div class="issue-fix">Fix: {esc(iss["fix"])}</div>' if iss.get("fix") else ""
             st.markdown(
                 f'<div class="{cls}">'
-                f'<div class="issue-title">{iss["package"]}: {iss["issue"]}</div>'
+                f'<div class="issue-title">{esc(iss["package"])}: {esc(iss["issue"])}</div>'
                 f'{fix_html}</div>', unsafe_allow_html=True)
 
 
@@ -1229,8 +1263,7 @@ with tab_readme_ai:
     st.markdown('<div class="section-header">📝 AI README OPTIMIZER</div>', unsafe_allow_html=True)
     st.markdown("Improve any repository's README with AI — powered by your selected AI engine.")
 
-    _is_cloud = bool(os.environ.get("SPACE_ID") or os.environ.get("R2P_CLOUD"))
-    _ai_use_hf = user_constraints.get("use_hf", False) or _is_cloud
+    _ai_use_hf = user_constraints.get("use_hf", False) or CLOUD_MODE
     _ai_use_ollama = user_constraints.get("use_ollama", False)
     _ai_hf_token = user_constraints.get("hf_token", "")
     _ai_ollama_model = user_constraints.get("ollama_model", "llama3.2")
@@ -1274,10 +1307,16 @@ with tab_readme_ai:
         ):
             full_text += chunk
             improved_container.markdown(full_text + "▌")
-        improved_container.markdown(full_text)
 
-        if full_text and not full_text.startswith("Error") and not full_text.startswith("⚠️"):
-            st.session_state["_optimized_readme"] = full_text
+        if ai_is_error(full_text):
+            # Backend failure, not a README. Show it as an error and keep it out
+            # of the download button.
+            improved_container.empty()
+            st.error(ai_error_message(full_text))
+        else:
+            improved_container.markdown(full_text)
+            if full_text.strip():
+                st.session_state["_optimized_readme"] = full_text
 
     if "_optimized_readme" in st.session_state:
         st.download_button(
@@ -1296,8 +1335,7 @@ with tab_chat:
     st.markdown('<div class="section-header">💬 CHAT WITH REPO2PRODUCT AI</div>', unsafe_allow_html=True)
     st.markdown("Ask anything about this project's architecture, resource consumption, or dependencies.")
 
-    _is_cloud = bool(os.environ.get("SPACE_ID") or os.environ.get("R2P_CLOUD"))
-    _ai_use_hf = user_constraints.get("use_hf", False) or _is_cloud
+    _ai_use_hf = user_constraints.get("use_hf", False) or CLOUD_MODE
     _ai_use_ollama = user_constraints.get("use_ollama", False)
     _ai_hf_token = user_constraints.get("hf_token", "")
     _ai_ollama_model = user_constraints.get("ollama_model", "llama3.2")
@@ -1346,6 +1384,14 @@ with tab_chat:
             ):
                 full_answer += chunk
                 response_placeholder.markdown(full_answer + "▌")
-            response_placeholder.markdown(full_answer)
 
-        st.session_state.chat_history.append({"role": "assistant", "content": full_answer})
+            if ai_is_error(full_answer):
+                response_placeholder.empty()
+                st.error(ai_error_message(full_answer))
+            else:
+                response_placeholder.markdown(full_answer)
+
+        # A backend error is not an answer — appending it would poison the
+        # context of every following turn.
+        if not ai_is_error(full_answer):
+            st.session_state.chat_history.append({"role": "assistant", "content": full_answer})

@@ -7,6 +7,8 @@ from typing import Dict, List, Any, Optional
 from pathlib import Path
 import logging
 
+from utils.package_imports import to_import_name
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,23 +44,29 @@ class AdaptivePlanner:
         self.frameworks = [fw["name"] for fw in structure.get("frameworks", [])]
         self.entry_points = structure.get("entry_points", [])
 
+        # generate_full_plan() renders the same plan generate_plan() returns;
+        # deriving it twice was pure duplicated work.
+        self._plan: Optional[Dict[str, Any]] = None
+
     # ------------------------------------------------------------------ #
     #  Main plan generation                                                #
     # ------------------------------------------------------------------ #
 
     def generate_plan(self) -> Dict[str, Any]:
         """Generate the complete setup and run plan."""
-        return {
-            "overview": self._generate_overview(),
-            "prerequisites": self._generate_prerequisites(),
-            "setup_steps": self._generate_setup_steps(),
-            "environment_setup": self._generate_env_setup(),
-            "run_commands": self._generate_run_commands(),
-            "troubleshooting": self._generate_troubleshooting(),
-            "expected_output": self._generate_expected_output(),
-            "optimization_tips": self._generate_optimization_tips(),
-            "full_plan_text": "",  # filled at end
-        }
+        if self._plan is None:
+            self._plan = {
+                "overview": self._generate_overview(),
+                "prerequisites": self._generate_prerequisites(),
+                "setup_steps": self._generate_setup_steps(),
+                "environment_setup": self._generate_env_setup(),
+                "run_commands": self._generate_run_commands(),
+                "troubleshooting": self._generate_troubleshooting(),
+                "expected_output": self._generate_expected_output(),
+                "optimization_tips": self._generate_optimization_tips(),
+                "full_plan_text": "",  # filled at end
+            }
+        return self._plan
 
     def generate_full_plan(self) -> str:
         """Render a complete human-readable setup guide."""
@@ -183,8 +191,15 @@ class AdaptivePlanner:
         prereqs.append(f"Python {py_ver}+ installed (`python --version`)")
         prereqs.append("pip installed and updated (`pip install --upgrade pip`)")
         prereqs.append("git installed (`git --version`)")
-        prereqs.append(f"At least {self.resources['ram']['minimum_gb']}GB free RAM")
-        prereqs.append(f"At least {self.resources['disk']['install_gb']}GB free disk space")
+        # Defensive lookups: a partial pipeline run can hand us an estimate that
+        # is missing these sections, and a KeyError here used to abort the whole
+        # plan stage.
+        min_ram = self.resources.get("ram", {}).get("minimum_gb")
+        if min_ram:
+            prereqs.append(f"At least {min_ram}GB free RAM")
+        install_gb = self.resources.get("disk", {}).get("install_gb")
+        if install_gb:
+            prereqs.append(f"At least {install_gb}GB free disk space")
 
         if "Django" in self.frameworks:
             prereqs.append("Database (SQLite for development, PostgreSQL for production)")
@@ -260,16 +275,21 @@ class AdaptivePlanner:
                 install_cmds.insert(0, "pip install --upgrade pip")
             for d in py_projects.keys():
                 d_clean = d if d not in (".", "") else ""
-                prefix = f"cd {d_clean} && " if d_clean else ""
-                install_cmds.append(f"{prefix}pip install -r requirements.txt")
+                if d_clean:
+                    # Subshell, so consecutive sub-projects don't compound the cd.
+                    install_cmds.append(f'( cd "{d_clean}" && pip install -r requirements.txt )')
+                else:
+                    install_cmds.append("pip install -r requirements.txt")
 
         # Node deps
         node_projects = self.deps.get("node", {}).get("projects", {})
         if node_projects:
             for d in node_projects.keys():
                 d_clean = d if d not in (".", "") else ""
-                prefix = f"cd {d_clean} && " if d_clean else ""
-                install_cmds.append(f"{prefix}npm install")
+                if d_clean:
+                    install_cmds.append(f'( cd "{d_clean}" && npm install )')
+                else:
+                    install_cmds.append("npm install")
 
         install_desc = "Install all required packages (adapted for CPU-only operation)." if not self.has_gpu else "Install all required packages."
         steps.append({
@@ -282,11 +302,16 @@ class AdaptivePlanner:
         # Step 4: Environment configuration
         env_vars = self.structure.get("env_variables", {})
         if env_vars:
+            file_names = {Path(p).name for p in self.fetch.get("file_list", [])}
+            copy_cmd = (
+                "cp .env.example .env  # Copy template"
+                if ".env.example" in file_names else "touch .env"
+            )
             steps.append({
                 "title": "Configure Environment Variables",
                 "description": "Set up your `.env` file with required configuration.",
                 "commands": [
-                    "cp .env.example .env  # Copy template" if ".env.example" in " ".join(self.fetch.get("file_list", [])) else "touch .env",
+                    copy_cmd,
                     "# Edit .env with your values:",
                     "nano .env  # or use your preferred editor",
                 ],
@@ -334,10 +359,17 @@ class AdaptivePlanner:
 
     def _generate_verify_commands(self) -> List[str]:
         cmds = ["python -c \"import sys; print(f'Python {sys.version}')\""]
-        for dep in self.deps.get("python", {}).get("all", [])[:5]:
-            name = dep["name"].replace("-", "_").split(".")[0]
+        for dep in self.deps.get("python", {}).get("all", []):
+            if dep.get("gpu_required"):
+                continue  # will not import on a CPU-only box by design
+            # Distribution name != import name for a good number of packages.
+            name = to_import_name(dep["name"])
+            if not name:
+                continue
             cmds.append(f"python -c \"import {name}; print('{dep['name']} OK')\"")
-        return cmds[:6]
+            if len(cmds) >= 6:
+                break
+        return cmds
 
     def _generate_env_setup(self) -> Dict[str, Any]:
         env_vars = self.structure.get("env_variables", {})
@@ -379,7 +411,6 @@ class AdaptivePlanner:
         project_type = self.project_type
 
         # Detect entry points
-        entry_names = [ep["name"] for ep in self.entry_points]
         main_entry = next((ep["path"] for ep in self.entry_points), None)
 
         if "Django" in self.frameworks:
@@ -407,8 +438,10 @@ class AdaptivePlanner:
             module = Path(entry).stem
             runs.append({
                 "label": "Flask Dev Server",
-                "command": f"flask run --host=0.0.0.0 --port=5000",
-                "note": "Set FLASK_APP=app.py if needed",
+                # FLASK_APP is set inline: `flask run` fails outright without it
+                # unless the entry file happens to be named app.py or wsgi.py.
+                "command": f"FLASK_APP={module} flask run --host=0.0.0.0 --port=5000",
+                "note": f"Entry module detected as {module}",
             })
         elif "Streamlit" in self.frameworks:
             entry = main_entry or "app.py"
@@ -430,13 +463,23 @@ class AdaptivePlanner:
             for d, proj in node_projects.items():
                 scripts = proj.get("scripts", {})
                 d_clean = d if d not in (".", "") else ""
-                prefix = f"cd {d_clean} && " if d_clean else ""
                 if "start" in scripts:
-                    runs.append({"label": f"Start App ({d_clean or 'root'})", "command": f"{prefix}npm start", "note": ""})
+                    inner = "npm start"
                 elif "dev" in scripts:
-                    runs.append({"label": f"Development Mode ({d_clean or 'root'})", "command": f"{prefix}npm run dev", "note": ""})
+                    inner = "npm run dev"
                 elif not scripts:
-                    runs.append({"label": f"Start App ({d_clean or 'root'})", "command": f"{prefix}node index.js", "note": ""})
+                    inner = "node index.js"
+                else:
+                    continue
+                label = ("Start App" if inner != "npm run dev" else "Development Mode")
+                # Wrapped in a subshell: run.sh executes these in sequence, and a
+                # bare `cd` would leak into every command after it.
+                command = f'( cd "{d_clean}" && {inner} )' if d_clean else inner
+                runs.append({
+                    "label": f"{label} ({d_clean or 'root'})",
+                    "command": command,
+                    "note": "",
+                })
 
         if not runs and main_entry:
             runs.append({

@@ -3,7 +3,7 @@ resource_engine/resource_estimator.py — Repo2Product AI
 Estimates resource requirements and adapts project to user constraints.
 """
 
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 import logging
 
 logger = logging.getLogger(__name__)
@@ -250,9 +250,24 @@ class ResourceEstimator:
         return notes
 
     def _detect_python_version(self) -> Dict[str, str]:
-        for path, content in self.deps.items():
-            pass  # placeholder — check .python-version, pyproject.toml, etc.
-        return {"minimum": "3.8", "recommended": "3.10+"}
+        """
+        Report the project's declared Python requirement.
+
+        The previous body looped over self.deps and did nothing (`pass`), always
+        returning the same hardcoded answer. DependencyDetector now extracts the
+        real declaration from .python-version / requires-python / python_requires,
+        so read that and fall back to the generic advice only when absent.
+        """
+        declared = self.deps.get("python_requirement", {}) or {}
+        minimum = declared.get("minimum", "")
+        if minimum:
+            return {
+                "minimum": minimum,
+                "recommended": f"{minimum}+",
+                "declared": declared.get("declared", ""),
+                "source": declared.get("source", ""),
+            }
+        return {"minimum": "3.8", "recommended": "3.10+", "declared": "", "source": "default"}
 
     def _check_network_deps(self, deps: List[Dict]) -> Dict[str, Any]:
         api_key_deps = [d["name"] for d in deps if d.get("requires_api_key")]
@@ -321,6 +336,7 @@ class ConstraintEngine:
 
         package_replacements = []
         code_modifications = []
+        gpu_patches = []
         disabled_features = []
         removed_packages = []
         environment_changes = []
@@ -339,11 +355,33 @@ class ConstraintEngine:
                             "reason": "GPU required → CPU alternative",
                             "note": alt_info.get("note", ""),
                         })
-                    elif alt_info.get("replacement") is None:
+                    else:
+                        # Two different situations used to land here identically:
+                        # a package we know has no CPU substitute, and one we
+                        # simply have no entry for. Say which, so the user knows
+                        # whether dropping it from requirements is safe.
+                        known = name in LIGHTWEIGHT_ALTERNATIVES
+                        profile_alts = [a for a in dep.get("alternatives", []) if a]
+                        if known:
+                            impact = alt_info.get("note") or "Feature will be disabled"
+                        elif profile_alts:
+                            impact = (
+                                "Feature will be disabled. Candidates worth evaluating "
+                                f"manually: {', '.join(profile_alts)}"
+                            )
+                        else:
+                            impact = (
+                                "Feature will be disabled. No CPU alternative is known to "
+                                "Repo2Product — review this package before removing it."
+                            )
                         removed_packages.append({
                             "package": name,
-                            "reason": "GPU-only package — no CPU alternative",
-                            "impact": alt_info.get("note", "Feature will be disabled"),
+                            "reason": (
+                                "GPU-only package — no CPU alternative" if known
+                                else "GPU-only package — no CPU alternative on record"
+                            ),
+                            "impact": impact,
+                            "confidence": "high" if known else "low",
                         })
                         disabled_features.append({
                             "feature": name,
@@ -367,14 +405,23 @@ class ConstraintEngine:
                             "reason": "Install CPU-only variant",
                         })
 
-            # Add GPU suppression code patches
-            for patch in GPU_CODE_PATTERNS:
-                code_modifications.append({
-                    "type": "regex_patch",
-                    "pattern": patch["pattern"],
-                    "replacement": patch["replacement"],
-                    "description": patch["description"],
-                })
+            # GPU suppression patches only make sense when there is GPU-aware
+            # code to suppress. They were previously emitted for every CPU-only
+            # run, so a plain Flask app was told to patch eleven CUDA calls.
+            gpu_aware_packages = {"torch", "tensorflow", "tensorflow-gpu", "jax", "cupy",
+                                  "transformers", "diffusers", "paddlepaddle", "mxnet"}
+            has_gpu_code = any(
+                d.get("gpu_required") or d.get("gpu_optional") or d["name"] in gpu_aware_packages
+                for d in python_deps
+            )
+            if has_gpu_code:
+                for patch in GPU_CODE_PATTERNS:
+                    gpu_patches.append({
+                        "type": "regex_patch",
+                        "pattern": patch["pattern"],
+                        "replacement": patch["replacement"],
+                        "description": patch["description"],
+                    })
 
         # ── RAM adaptations ────────────────────────────────────────────
         resource_est = self.deps.get("summary", {}).get("resource_estimate", {})
@@ -429,8 +476,11 @@ class ConstraintEngine:
             "compatibility_label": self._score_label(score),
             "package_replacements": package_replacements,
             "removed_packages": removed_packages,
-            "code_modifications": [m for m in code_modifications if m.get("package") or m.get("type") == "regex_patch"],
-            "gpu_patches": [m for m in code_modifications if m.get("type") == "regex_patch"],
+            # code_modifications = per-package guidance; gpu_patches = regex
+            # patches. These used to be the same list filtered two ways, so the
+            # UI showed every patch twice.
+            "code_modifications": code_modifications,
+            "gpu_patches": gpu_patches,
             "disabled_features": disabled_features,
             "environment_changes": environment_changes,
             "adapted_requirements": new_reqs,
@@ -438,9 +488,35 @@ class ConstraintEngine:
                 "packages_replaced": len(package_replacements),
                 "packages_removed": len(removed_packages),
                 "features_disabled": len(disabled_features),
-                "code_patches_needed": len([m for m in code_modifications if m.get("type") == "regex_patch"]),
+                "code_patches_needed": len(gpu_patches),
             },
         }
+
+    # Recognised PEP 440 comparison operators, longest first so "==" is not
+    # matched as "=" and ">=" is not matched as ">".
+    _VERSION_OPERATORS = ("===", "==", "!=", "<=", ">=", "~=", "<", ">")
+
+    @classmethod
+    def _normalize_version_spec(cls, version: str) -> str:
+        """
+        Keep the author's version constraint intact.
+
+        The previous implementation rewrote every specifier as `>=`, which
+        silently unpinned `==1.2.3`, widened `~=1.4` and inverted `!=2.0`.
+        """
+        if not version:
+            return ""
+        spec = version.strip()
+        if not spec or spec.lower() == "any":
+            return ""
+        # Already a valid specifier (possibly a comma-separated set) — pass through.
+        if spec.startswith(cls._VERSION_OPERATORS):
+            return spec
+        # A bare version such as "1.2.3" (Pipfile/pyproject style) becomes a
+        # minimum bound, which is the closest faithful reading.
+        if spec[0].isdigit():
+            return f">={spec}"
+        return ""
 
     def _build_adapted_requirements(
         self,
@@ -460,11 +536,10 @@ class ConstraintEngine:
 
         for dep in original:
             name = dep["name"]
-            version = dep.get("version", "")
-            version_str = f">={version.lstrip('><=!~^').split(',')[0]}" if version and version != "any" else ""
+            version_str = self._normalize_version_spec(dep.get("version", ""))
 
             if name in removed_set:
-                lines.append(f"# REMOVED: {name}  # GPU-only, not compatible with CPU")
+                lines.append(f"# REMOVED: {name}{version_str}  # GPU-only, not compatible with CPU")
                 continue
 
             if name in replacement_map:
@@ -473,15 +548,14 @@ class ConstraintEngine:
                 install_cmd = rep.get("install_cmd", "")
                 if install_cmd:
                     lines.append(f"# Install separately: pip install {install_cmd}")
-                    lines.append(f"# REPLACED: {name}")
+                    lines.append(f"# REPLACED: {name}{version_str}")
                     continue
                 else:
                     lines.append(f"# Replaced: {name} → {rep_name}")
-                    lines.append(f"{rep_name}{version_str}")
+                    # A replacement package does not share the original's
+                    # version history, so the original pin must not be carried over.
+                    lines.append(f"{rep_name}")
                     continue
-
-            if name == "editable-install":
-                continue
 
             lines.append(f"{name}{version_str}")
 
@@ -498,10 +572,22 @@ class ConstraintEngine:
             return 90
 
         base = 100
-        gpu_required = [d for d in deps if d.get("gpu_required")]
-        base -= len(gpu_required) * 15
+        removed_set = {r["package"] for r in removed}
+        replaced_set = {r["original"] for r in replacements}
+
+        # A GPU package that we removed was already charged as a removal, and one
+        # we replaced is largely handled — charging all three used to double- and
+        # triple-penalise the same package.
+        unresolved_gpu = [
+            d for d in deps
+            if d.get("gpu_required") and d["name"] not in removed_set and d["name"] not in replaced_set
+        ]
+        base -= len(unresolved_gpu) * 15
         base -= len(removed) * 10
-        base -= len(disabled) * 5
+        base -= len([r for r in replacements if r.get("reason", "").startswith("GPU required")]) * 5
+        # Disabled features that aren't just the removal restated.
+        extra_disabled = [d for d in disabled if d.get("feature") not in removed_set]
+        base -= len(extra_disabled) * 5
         return max(0, min(100, base))
 
     def _score_label(self, score: int) -> str:

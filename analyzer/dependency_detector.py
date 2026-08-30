@@ -7,10 +7,16 @@ Provides version parsing, conflict detection, and weight classification.
 import re
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Nominal cost charged to a package that has no entry in DEPENDENCY_PROFILES.
+# Roughly a small pure-Python library: not accurate, but far closer than zero,
+# which is what unprofiled packages used to cost.
+UNKNOWN_PACKAGE_RAM_MB = 15
+UNKNOWN_PACKAGE_DISK_MB = 20
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -188,6 +194,7 @@ class DependencyDetector:
             "node": self._parse_node_deps(),
             "system": self._parse_system_deps(),
             "docker": self._parse_docker_deps(),
+            "python_requirement": self.detect_python_requirement(),
             "summary": {},
         }
 
@@ -227,7 +234,7 @@ class DependencyDetector:
             fname = Path(path).name
             d = str(Path(path).parent)
             if fname.startswith("requirements") and fname.endswith(".txt"):
-                parsed = self._parse_requirements_txt(content, source="requirements.txt")
+                parsed = self._parse_requirements_txt(content, source=path)
                 deps["requirements_txt"].extend(parsed)
                 deps["projects"].setdefault(d, []).extend(parsed)
             # Pipfile
@@ -260,14 +267,18 @@ class DependencyDetector:
             profile = DEPENDENCY_PROFILES.get(dep["name"].lower(), {})
             dep.update({
                 "weight": profile.get("weight", "unknown"),
-                "ram_mb": profile.get("ram_mb", 0),
-                "disk_mb": profile.get("disk_mb", 0),
+                # An unprofiled package is not a free package. Charging it nothing
+                # made totals systematically low for any repo using packages we
+                # don't have a profile for; charge a modest placeholder and say so.
+                "ram_mb": profile.get("ram_mb", UNKNOWN_PACKAGE_RAM_MB),
+                "disk_mb": profile.get("disk_mb", UNKNOWN_PACKAGE_DISK_MB),
+                "estimated": not profile,
                 "gpu_required": profile.get("gpu_required", False),
                 "gpu_optional": profile.get("gpu_optional", False),
                 "requires_api_key": profile.get("requires_api_key", False),
                 "local_llm": profile.get("local_llm", False),
                 "alternatives": profile.get("alternatives", []),
-                "note": profile.get("note", ""),
+                "note": profile.get("note", "" if profile else "No resource profile — using a nominal estimate"),
             })
 
         return deps
@@ -279,16 +290,21 @@ class DependencyDetector:
             line = line.strip()
             if not line or line.startswith("#") or line.startswith("-r") or line.startswith("--"):
                 continue
-            # Handle -e git+... editable installs
-            if line.startswith("-e "):
-                deps.append({"name": "editable-install", "version": line[3:], "source": source})
+            # Editable/VCS installs have no resolvable distribution name here, and a
+            # synthetic one would flow into the generated verify.py as a bogus import.
+            if line.startswith("-e ") or line.startswith("git+"):
+                logger.debug(f"Skipping editable/VCS requirement in {source}: {line}")
+                continue
+            # Strip inline comments and environment markers before matching.
+            line = line.split(" #", 1)[0].split(";", 1)[0].strip()
+            if not line:
                 continue
             # Parse: package==1.0, package>=1.0, package[extra], etc.
             match = re.match(r"^([a-zA-Z0-9_\-\.]+)(?:\[.*?\])?\s*([><=!~^].+)?$", line)
             if match:
                 deps.append({
                     "name": match.group(1).lower(),
-                    "version": match.group(2) or "any",
+                    "version": (match.group(2) or "any").strip(),
                     "source": source,
                 })
         return deps
@@ -306,7 +322,14 @@ class DependencyDetector:
             elif in_packages and "=" in line:
                 key, _, val = line.partition("=")
                 name = key.strip().strip('"').strip("'").lower()
-                version = val.strip().strip('"').strip("'")
+                version = val.strip()
+                if version.startswith("{"):
+                    inner = re.search(r'version\s*=\s*["\']([^"\']+)["\']', version)
+                    version = inner.group(1) if inner else "*"
+                version = version.strip('"').strip("'")
+                # Pipfile spells "no constraint" as "*".
+                if version in ("*", ""):
+                    version = "any"
                 if name:
                     deps.append({"name": name, "version": version, "source": "Pipfile"})
         return deps
@@ -314,36 +337,67 @@ class DependencyDetector:
     def _parse_pyproject(self, content: str) -> List[Dict[str, str]]:
         """Parse pyproject.toml dependencies section."""
         deps = []
-        # Match [tool.poetry.dependencies] or [project] dependencies
-        dep_pattern = re.compile(
-            r'^([a-zA-Z0-9_\-\.]+)\s*=\s*["\'^~>=<{]', re.MULTILINE
-        )
-        inline_pattern = re.compile(
-            r'"([a-zA-Z0-9_\-\.]+)\s*[><=!~^]'
-        )
+        seen = set()
 
-        # Search for dependencies array (PEP 621)
+        def add(name: str, version: str) -> None:
+            key = name.lower()
+            if key and key not in seen and key != "python":
+                seen.add(key)
+                deps.append({"name": key, "version": version or "any", "source": "pyproject.toml"})
+
+        # PEP 621: dependencies = ["requests>=2.0", "flask~=3.0"].
+        # The version specifier used to be discarded and replaced with "any",
+        # which is how pinned projects lost their pins in the adapted output.
         deps_section = re.search(r'dependencies\s*=\s*\[(.*?)\]', content, re.DOTALL)
         if deps_section:
-            for match in inline_pattern.finditer(deps_section.group(1)):
-                deps.append({"name": match.group(1).lower(), "version": "any", "source": "pyproject.toml"})
+            for item in re.findall(r'["\']([^"\']+)["\']', deps_section.group(1)):
+                entry = item.split(" #", 1)[0].split(";", 1)[0].strip()
+                m = re.match(r'^([a-zA-Z0-9_\-\.]+)(?:\[[^\]]*\])?\s*(.*)$', entry)
+                if m:
+                    add(m.group(1), m.group(2).strip())
 
-        # Poetry style
+        # Poetry style: requests = "^2.0"  /  torch = { version = "2.1" }
+        poetry_line = re.compile(r'^([a-zA-Z0-9_\-\.]+)\s*=\s*(.+)$')
         in_deps = False
         for line in content.splitlines():
             stripped = line.strip()
-            if stripped in ('[tool.poetry.dependencies]', '[tool.poetry.dev-dependencies]'):
+            if stripped.startswith('[tool.poetry') and 'dependencies' in stripped:
                 in_deps = True
             elif stripped.startswith('['):
                 in_deps = False
             elif in_deps and '=' in stripped and not stripped.startswith('#'):
-                m = dep_pattern.match(stripped)
-                if m:
-                    name = m.group(1).lower()
-                    if name not in ('python',):
-                        deps.append({"name": name, "version": "any", "source": "pyproject.toml"})
+                m = poetry_line.match(stripped)
+                if not m:
+                    continue
+                raw = m.group(2).strip()
+                if raw.startswith('{'):
+                    inner = re.search(r'version\s*=\s*["\']([^"\']+)["\']', raw)
+                    raw = inner.group(1) if inner else ""
+                else:
+                    raw = raw.strip('"').strip("'")
+                add(m.group(1), self._poetry_version(raw))
 
         return deps
+
+    @staticmethod
+    def _poetry_version(spec: str) -> str:
+        """Translate Poetry's caret/tilde shorthand into a pip-installable spec."""
+        spec = spec.strip()
+        if not spec or spec == "*":
+            return "any"
+        if spec.startswith("^"):
+            # ^1.2.3 means >=1.2.3,<2.0.0
+            base = spec[1:]
+            head = base.split(".")[0]
+            try:
+                return f">={base},<{int(head) + 1}.0.0"
+            except ValueError:
+                return f">={base}"
+        if spec.startswith("~"):
+            return f"~={spec.lstrip('~')}"
+        if spec[0].isdigit():
+            return f"=={spec}"
+        return spec
 
     def _parse_setup_py(self, content: str) -> List[Dict[str, str]]:
         """Extract install_requires from setup.py."""
@@ -355,10 +409,54 @@ class DependencyDetector:
         if match:
             items = re.findall(r'["\']([^"\']+)["\']', match.group(1))
             for item in items:
-                m = re.match(r'^([a-zA-Z0-9_\-\.]+)', item)
+                entry = item.split(" #", 1)[0].split(";", 1)[0].strip()
+                m = re.match(r'^([a-zA-Z0-9_\-\.]+)(?:\[[^\]]*\])?\s*(.*)$', entry)
                 if m:
-                    deps.append({"name": m.group(1).lower(), "version": "any", "source": "setup.py"})
+                    deps.append({
+                        "name": m.group(1).lower(),
+                        "version": m.group(2).strip() or "any",
+                        "source": "setup.py",
+                    })
         return deps
+
+    def detect_python_requirement(self) -> Dict[str, str]:
+        """
+        Find the Python version the project declares, if any.
+
+        Looks at .python-version, runtime.txt, `requires-python`, Poetry's
+        `python = "..."` and setup.py's `python_requires`.
+        """
+        result = {"declared": "", "source": "", "minimum": ""}
+
+        def finish(declared: str, source: str) -> Dict[str, str]:
+            result["declared"] = declared.strip()
+            result["source"] = source
+            m = re.search(r"(\d+\.\d+)", declared)
+            result["minimum"] = m.group(1) if m else ""
+            return result
+
+        for path, content in self.key_files.items():
+            name = Path(path).name
+            if name == ".python-version" and content.strip():
+                return finish(content.strip().splitlines()[0], name)
+            if name == "runtime.txt" and "python-" in content:
+                return finish(content.strip().split("python-", 1)[1], name)
+
+        for path, content in self.key_files.items():
+            name = Path(path).name
+            if name == "pyproject.toml":
+                m = re.search(r'requires-python\s*=\s*["\']([^"\']+)["\']', content)
+                if m:
+                    return finish(m.group(1), "pyproject.toml (requires-python)")
+                m = re.search(r'^\s*python\s*=\s*["\']([^"\']+)["\']', content, re.MULTILINE)
+                if m:
+                    return finish(m.group(1), "pyproject.toml (poetry)")
+            elif name == "setup.py":
+                m = re.search(r'python_requires\s*=\s*["\']([^"\']+)["\']', content)
+                if m:
+                    return finish(m.group(1), "setup.py")
+
+        return result
 
     # ------------------------------------------------------------------ #
     #  Node.js dependency parsing                                          #
@@ -488,10 +586,13 @@ class DependencyDetector:
         """Estimate total RAM and disk requirements."""
         total_ram = 200  # base OS overhead
         total_disk = 500  # base Python install
+        estimated_count = 0
 
         for dep in deps:
-            total_ram += dep.get("ram_mb", 0)
-            total_disk += dep.get("disk_mb", 0)
+            total_ram += dep.get("ram_mb", UNKNOWN_PACKAGE_RAM_MB)
+            total_disk += dep.get("disk_mb", UNKNOWN_PACKAGE_DISK_MB)
+            if dep.get("estimated"):
+                estimated_count += 1
 
         return {
             "estimated_ram_mb": total_ram,
@@ -500,4 +601,7 @@ class DependencyDetector:
             "estimated_disk_gb": round(total_disk / 1024, 1),
             "ram_warning": total_ram > 6144,
             "disk_warning": total_disk > 10000,
+            # How much of the total is guesswork, so the UI can qualify the number.
+            "unprofiled_packages": estimated_count,
+            "profiled_packages": len(deps) - estimated_count,
         }
